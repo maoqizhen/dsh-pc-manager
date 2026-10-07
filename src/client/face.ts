@@ -19,6 +19,27 @@ export const MIN_POLL_MS = 500
 /** Samples kept per sparkline. */
 export const HISTORY_LIMIT = 60
 
+/**
+ * Host route keys (origin-absolute, matching the host half's webServer
+ * registrations).
+ */
+const STREAM_ENDPOINT = '/pc-manager/stream'
+const STATUS_ENDPOINT = '/pc-manager/status'
+const JUNK_SCAN_ENDPOINT = '/pc-manager/junk/scan'
+const JUNK_CLEAN_ENDPOINT = '/pc-manager/junk/clean'
+
+/**
+ * Document-relative forms the browser actually fetches. The served shell
+ * owns its mount (`<base href="./">`): behind a prefix-stripping proxy the
+ * page lives at `/dsh/`, so a root-absolute path would leave the app. See the
+ * harness note "web-document-relative-app-routes" — the same rule the HMR
+ * channel's `/plugins/events` follows.
+ */
+const STREAM_ROUTE = STREAM_ENDPOINT.slice(1)
+const STATUS_ROUTE = STATUS_ENDPOINT.slice(1)
+const JUNK_SCAN_ROUTE = JUNK_SCAN_ENDPOINT.slice(1)
+const JUNK_CLEAN_ROUTE = JUNK_CLEAN_ENDPOINT.slice(1)
+
 /** One dashboard frame off the stream: snapshot plus server-derived rates. */
 export interface DashboardFrameWire {
   status: SystemStatus
@@ -153,7 +174,7 @@ function openStream(): void {
   source?.close()
   stopWatchdog()
   lastReconnectAt = Date.now()
-  const stream = new EventSource('/pc-manager/stream')
+  const stream = new EventSource(STREAM_ROUTE)
   source = stream
   stream.onopen = () => notify({ connected: true, error: null })
   stream.onmessage = (event: MessageEvent<string>) => {
@@ -222,7 +243,7 @@ export function refetchStream(): void {
  * because only the pump can difference per-pid windows.
  */
 export function fetchProcessRows(sort: ProcessSort, signal: AbortSignal): Promise<ProcessInfo[]> {
-  return fetch(`/pc-manager/status?processSort=${encodeURIComponent(sort)}`, { signal })
+  return fetch(`${STATUS_ROUTE}?processSort=${encodeURIComponent(sort)}`, { signal })
     .then(response => {
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       return response.json() as Promise<SystemStatus>
@@ -267,7 +288,7 @@ export interface JunkPlanResponse {
 
 /** One-shot read-only junk scan for the plan card; caller owns the abort. */
 export function fetchJunkPlan(signal: AbortSignal): Promise<JunkPlanResponse> {
-  return fetch('/pc-manager/junk/scan', { signal })
+  return fetch(JUNK_SCAN_ROUTE, { signal })
     .then(response => {
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       return response.json() as Promise<JunkPlanResponse>
@@ -301,7 +322,7 @@ export interface JunkCleanError {
  * Resolves with the per-item outcomes; rejects with a code-tagged Error.
  */
 export function postJunkClean(ids: readonly string[], signal: AbortSignal): Promise<JunkCleanResultWire> {
-  return fetch('/pc-manager/junk/clean', {
+  return fetch(JUNK_CLEAN_ROUTE, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ids }),
