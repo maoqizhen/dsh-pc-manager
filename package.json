@@ -15,7 +15,8 @@
     "system-monitor",
     "junk-cleanup",
     "macos",
-    "linux"
+    "linux",
+    "windows"
   ],
   "engines": {
     "dsh": ">=0.2.0-rc.1",

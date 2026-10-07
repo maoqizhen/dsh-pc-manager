@@ -133,6 +133,10 @@ const CSS = `
   box-sizing: border-box; }
 .pc-manager-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .pc-manager-label { font-weight: 600; }
+/* The GPU card headlines an adapter name, which is longer than any other card
+   label; it shrinks with an ellipsis (the full name stays in the tooltip) and
+   the percentage keeps its own space. */
+.pc-manager-gpu-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pc-manager-value { font-variant-numeric: tabular-nums; }
 .pc-manager-value[data-tone='critical'] { color: var(--pcm-critical); font-weight: 600; }
 .pc-manager-muted { color: color-mix(in srgb, currentColor 62%, transparent);

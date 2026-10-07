@@ -43,15 +43,16 @@ function percentLabel(value: number | null): string {
 function platformLabel(platform: string): string {
   if (platform === 'darwin') return 'macOS'
   if (platform === 'linux') return 'Linux'
+  if (platform === 'win32') return 'Windows'
   return platform
 }
 
-/** Header OS line: macOS prefixes its product version; Linux PRETTY_NAME
- * already names the distro (`Debian GNU/Linux 12 (bookworm)`). */
+/** Header OS line: macOS prefixes its product version; Linux PRETTY_NAME and
+ * the Windows version string already name the OS themselves. */
 function osLabel(platform: string, osVersion: string | null): string {
   if (osVersion === null) return ''
   if (platform === 'darwin') return ` · macOS ${osVersion}`
-  if (platform === 'linux') return ` · ${osVersion}`
+  if (platform === 'linux' || platform === 'win32') return ` · ${osVersion}`
   return ` · ${platformLabel(platform)} ${osVersion}`
 }
 
@@ -159,13 +160,16 @@ function topInterface(sample: DashboardSample): { name: string, rxPerSec: number
 }
 
 /** Volume rows worth a dashboard card: the boot volume, macOS data overlays,
- * and user data mounts on both platforms. Recovery is a frozen system volume;
- * the domain snapshot keeps every volume for the model. */
+ * user data mounts on both POSIX platforms, and every Windows drive letter
+ * (a Windows volume IS its mount point, so `C:\` and a mapped `Z:\` both
+ * belong on the card). Recovery is a frozen system volume; the domain
+ * snapshot keeps every volume for the model. */
 function dashboardVolumes(disks: SystemStatus['disks']): SystemStatus['disks'] {
   return disks.filter(disk =>
     disk.mount === '/' || disk.mount === '/System/Volumes/Data'
     || (disk.mount.startsWith('/Volumes/') && disk.mount !== '/Volumes/Recovery')
-    || disk.mount.startsWith('/media/') || disk.mount.startsWith('/mnt/'))
+    || disk.mount.startsWith('/media/') || disk.mount.startsWith('/mnt/')
+    || /^[A-Za-z]:[\\/]?$/.test(disk.mount))
 }
 
 function CpuCard({ status, history, t }: {
@@ -180,11 +184,16 @@ function CpuCard({ status, history, t }: {
       <UsageBar percent={usage} label={t('card.cpu')} />
       <Sparkline values={history.cpu} />
       <div className='pc-manager-sub'>
-        <span className='pc-manager-muted'>{t('cpu.loadavg', {
-          one: formatLoad(status.cpu.loadavg[0]),
-          five: formatLoad(status.cpu.loadavg[1]),
-          fifteen: formatLoad(status.cpu.loadavg[2]),
-        })}</span>
+        {/* typeof/null guard: frames from an older host half predate the field
+            (undefined, not null), and Windows never has a load average — a
+            restart-window skew must hide the line, not crash the card. */}
+        {Array.isArray(status.cpu.loadavg) && status.cpu.loadavg.length === 3 && (
+          <span className='pc-manager-muted'>{t('cpu.loadavg', {
+            one: formatLoad(status.cpu.loadavg[0]),
+            five: formatLoad(status.cpu.loadavg[1]),
+            fifteen: formatLoad(status.cpu.loadavg[2]),
+          })}</span>
+        )}
         <span className='pc-manager-muted'>{t('cpu.cores', { cores: status.cpu.cores })}</span>
         {/* typeof guard: frames from an older host half predate the field
             (undefined, not null) — a restart-window skew must not crash the
@@ -195,6 +204,28 @@ function CpuCard({ status, history, t }: {
           </span>
         )}
       </div>
+    </section>
+  )
+}
+
+/** The GPU card. The adapter name headlines the card when the host can name it
+ * (Windows reads it from the display adapter; the other platforms' GPU sources
+ * expose only a percentage), and the narrow column ellipsizes it with the full
+ * name left in the tooltip. */
+function GpuCard({ status, t }: { status: SystemStatus, t: TranslateNS<'pcManager'> }): ReactNode {
+  const usage = status.gpu.usagePercent
+  if (usage === null) return null
+  const name = typeof status.gpu.name === 'string' && status.gpu.name.length > 0 ? status.gpu.name : null
+  const label = name ?? t('card.gpu')
+  return (
+    <section className='pc-manager-card'>
+      <div className='pc-manager-row'>
+        <span className='pc-manager-label pc-manager-gpu-name' title={name ?? undefined}>{label}</span>
+        <span className='pc-manager-value' data-tone={toneOf(usage) === 'critical' ? 'critical' : undefined}>
+          {percentLabel(usage)}
+        </span>
+      </div>
+      <UsageBar percent={usage} label={label} />
     </section>
   )
 }
@@ -309,9 +340,11 @@ function NetworkCard({ sample, history, t }: {
   )
 }
 
-/** Process basename for the table (the full command stays in the title tooltip). */
+/** Process basename for the table (the full command stays in the title
+ * tooltip). Both separators are honored so a Windows command path shortens. */
 function shortCommand(command: string): string {
-  return command.includes('/') ? command.split('/').pop() ?? command : command
+  const parts = command.split(/[\\/]/)
+  return parts[parts.length - 1] || command
 }
 
 /** Sortable table headers: the server-ranked metrics plus pid (client-ranked). */
@@ -547,12 +580,7 @@ export function DashboardBody(props: DashboardBodyProps): ReactNode {
           full-width sibling below it — it cannot cross the columns container. */}
       <div className='pc-manager-cards'>
         <CpuCard status={status} history={history} t={t} />
-        {status.gpu.usagePercent !== null && (
-          <section className='pc-manager-card'>
-            {cardHeading(t('card.gpu'), percentLabel(status.gpu.usagePercent), toneOf(status.gpu.usagePercent))}
-            <UsageBar percent={status.gpu.usagePercent} label={t('card.gpu')} />
-          </section>
-        )}
+        <GpuCard status={status} t={t} />
         <MemoryCard status={status} t={t} />
         <DisksCard status={status} t={t} />
         <BatteryCard status={status} t={t} />

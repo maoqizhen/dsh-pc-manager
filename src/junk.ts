@@ -1,10 +1,10 @@
 /**
- * System junk cleanup (垃圾清理) for macOS and Linux hosts. The target
- * registries (one per platform) are the core safety asset — which paths count
- * as junk, why, and how safe they are — while scanJunk (size walk, always
- * dry-run) and cleanJunk (validation chain plus Trash-first reclaim) are the
- * executors. Pure node:fs, zero cordis, so the module stays unit-testable
- * outside the harness.
+ * System junk cleanup (垃圾清理) for macOS, Linux, and Windows hosts. The
+ * target registries (one per platform) are the core safety asset — which paths
+ * count as junk, why, and how safe they are — while scanJunk (size walk,
+ * always dry-run) and cleanJunk (validation chain plus Trash-first reclaim)
+ * are the executors. Pure node:fs, zero cordis, so the module stays
+ * unit-testable outside the harness.
  * @module @deepseek-ai/dsh-pc-manager
  */
 
@@ -13,10 +13,70 @@ import { constants as fsConstants } from 'node:fs'
 import type { Dirent, Stats } from 'node:fs'
 import { access, cp, lstat, mkdir, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir, platform } from 'node:os'
-import { basename, join, normalize } from 'node:path'
+import { posix, win32 } from 'node:path'
 import { promisify } from 'node:util'
 import type { JunkCleanOutcome, JunkCleanResult, JunkItem, JunkKind, JunkScanReport, JunkSkipped } from './types.ts'
 import { PcManagerError } from './types.ts'
+import { PS_ARGV, PS_PREAMBLE, resolvePowershell } from './win32.ts'
+
+/**
+ * Path-literal flavor. The registries carry POSIX (macOS/Linux) and Windows
+ * paths side by side, and the test suite pins all three registries from any
+ * host — so every transform picks its flavor from the literal itself rather
+ * than from the host's `node:path` default, which would rewrite a POSIX
+ * fixture into `\Users\t\.Trash` when the suite runs on Windows.
+ */
+export type PathFlavor = 'win32' | 'posix'
+
+/** Flavor of one literal: a drive-absolute or UNC path is Windows, else POSIX. */
+export function pathFlavor(path: string): PathFlavor {
+  return /^[A-Za-z]:[\\/]/.test(path) || /^[\\/]{2}[^\\/]/.test(path) ? 'win32' : 'posix'
+}
+
+/** The `node:path` face for a flavor. */
+const apiFor = (flavor: PathFlavor): typeof posix => flavor === 'win32' ? win32 : posix
+
+/** Windows filesystems are case-insensitive; POSIX ones are not. */
+const foldCase = (flavor: PathFlavor, value: string): string =>
+  flavor === 'win32' ? value.toLowerCase() : value
+
+/**
+ * Normalize with the literal's own flavor, dropping a trailing separator
+ * (except at a root). The strip is a safety property, not cosmetics: without
+ * it `user-caches:/Users/x/.cache/` normalizes to the root itself yet still
+ * satisfies the "strictly under the root" test that guards children-kind
+ * deletion, which would let a trailing slash empty a whole registry root.
+ */
+export function normalizePath(path: string): string {
+  return normalizeLiteral(apiFor(pathFlavor(path)), path)
+}
+
+/** Normalization body, shared by the flavor-detecting entry point and the
+ * flavor-injected helpers below. */
+function normalizeLiteral(api: typeof posix, value: string): string {
+  const normalized = api.normalize(value)
+  const root = api.parse(normalized).root
+  return normalized.length > root.length && normalized.endsWith(api.sep)
+    ? normalized.slice(0, -1)
+    : normalized
+}
+
+/** Join with the base literal's flavor, so `/Users/t` + `.Trash` stays POSIX
+ * even on a Windows host, and a Windows base keeps its backslashes. */
+export function joinPath(base: string, ...parts: string[]): string {
+  return apiFor(pathFlavor(base)).join(base, ...parts)
+}
+
+/** True when the literal is absolute in its own flavor (POSIX `/…`, Windows
+ * `C:\…`/`C:/…`, or a UNC share). */
+export function isAbsolutePath(path: string): boolean {
+  return apiFor(pathFlavor(path)).isAbsolute(path)
+}
+
+/** Basename in the literal's own flavor (`C:\a\b` → `b` on any host). */
+export function basenamePath(path: string): string {
+  return apiFor(pathFlavor(path)).basename(path)
+}
 
 /** Every junk kind the registry (and the tool schema) knows; closed vocabulary. */
 export const JUNK_KINDS = [
@@ -108,6 +168,29 @@ export const LINUX_TEMP_PROTECTED: readonly string[] = [
   'falcon', 'crowdstrike', 'sentinelone', 's1agent', 'carbonblack', 'cb-defense',
   'mde', 'sophos', 'defender',
 ]
+
+/**
+ * Windows `system-temp` protections. `%TEMP%` and `%SystemRoot%\Temp` are
+ * shared by every process on the box, so live installer scaffolding is
+ * skipped (deleting a directory another process is using fails or breaks the
+ * install) and endpoint-security agents are protected for the same
+ * tamper-alert reason as the macOS/Linux lists.
+ */
+export const WINDOWS_TEMP_PROTECTED: readonly string[] = [
+  // endpoint-security / antivirus agents (tamper alerts, quarantined samples)
+  'CrowdStrike', 'CSFalcon', 'SentinelOne', 'Sentinel', 'Sophos', 'Tanium', 'CarbonBlack', 'CbDefense',
+  'mde', 'MsMpEng', 'MpCmdRun', 'MpEngine', 'Defender', 'avast', 'AVG', 'ESET', 'Kaspersky',
+  // live installer / servicing scaffolding
+  'scoped_dir', 'chrome_installer', 'VSIXInstaller', 'Microsoft Visual Studio', 'Roslyn',
+]
+
+/**
+ * Well-known Windows account SIDs whose Recycle Bin folders are never the
+ * current user's: LocalSystem, LocalService, and NetworkService. Other users'
+ * SID folders are not listed — they are unreadable from this account and
+ * degrade to `skipped` through the walk instead.
+ */
+export const WINDOWS_SYSTEM_SIDS: readonly string[] = ['S-1-5-18', 'S-1-5-19', 'S-1-5-20']
 
 /**
  * Match one first-level child name against a protection rule: a plain rule is
@@ -417,9 +500,204 @@ export const JUNK_TARGETS_LINUX: readonly JunkTarget[] = [
   },
 ]
 
-/** The current platform's registry (the safety asset the tools scan). */
+/**
+ * Windows junk families, 18 rows over 11 kinds. Roots are spelled with
+ * `%VAR%` placeholders (expanded by {@link resolveTargets}) because a Windows
+ * profile is relocatable: `%TEMP%`, `%LOCALAPPDATA%`, `%SystemRoot%`, and
+ * `%USERPROFILE%` follow the account and the system drive.
+ *
+ * Two deliberate differences from the macOS/Linux registries:
+ *
+ * - There is **no umbrella `user-caches` row**. `%LOCALAPPDATA%` is not a
+ *   cache directory the way `~/.cache` or `~/Library/Caches` is — it mixes
+ *   real per-app state (`Packages\*\LocalState`, `Microsoft\Credentials`,
+ *   browser profiles) with caches, and no protection list covers that
+ *   reliably. Only individually known-safe cache roots are registered.
+ * - Command-shaped reclaim (Windows Update's `SoftwareDistribution\Download`,
+ *   Delivery Optimization, `WinSxS` component cleanup) is NOT a row, matching
+ *   the macOS/Linux stance: those run through DISM/Storage Sense and live in
+ *   the README as suggested commands.
+ */
+export const JUNK_TARGETS_WIN32: readonly JunkTarget[] = [
+  {
+    kind: 'trash',
+    label: '回收站 ($Recycle.Bin)',
+    dir: '%SystemDrive%\\$Recycle.Bin',
+    safeToClean: true,
+    rationale: 'Files the user already discarded. Windows keeps one folder per account SID; this '
+      + 'account\'s folder is emptied in place (the local Recycle Bin operation). LocalSystem/'
+      + 'LocalService/NetworkService folders are excluded, and another account\'s folder is '
+      + 'unreadable and reported as skipped instead.',
+    granularity: 'children',
+    protectedChildren: WINDOWS_SYSTEM_SIDS,
+  },
+  {
+    kind: 'system-temp',
+    label: '用户临时文件 (%TEMP%)',
+    dir: '%TEMP%',
+    safeToClean: true,
+    rationale: 'Per-user temporary files; apps recreate them on demand. Only children untouched for '
+      + 'at least 3 days are reported, and live installer scaffolding plus endpoint-security agent '
+      + 'directories are excluded (deleting them breaks a running install or trips tamper alerts).',
+    granularity: 'children',
+    minAgeDays: 3,
+    protectedChildren: WINDOWS_TEMP_PROTECTED,
+  },
+  {
+    kind: 'system-temp',
+    label: '系统临时文件 (%SystemRoot%\\Temp)',
+    dir: '%SystemRoot%\\Temp',
+    safeToClean: true,
+    rationale: 'Machine-wide temporary files. Only children untouched for at least 3 days are '
+      + 'reported, with the same live-installer and endpoint-security exclusions as %TEMP%. Writing '
+      + 'here generally needs an elevated process, so expect unreadable children to be skipped.',
+    granularity: 'children',
+    minAgeDays: 3,
+    protectedChildren: WINDOWS_TEMP_PROTECTED,
+  },
+  {
+    kind: 'user-logs',
+    label: '错误报告存档 (%LOCALAPPDATA%\\…\\WER\\ReportArchive)',
+    dir: '%LOCALAPPDATA%\\Microsoft\\Windows\\WER\\ReportArchive',
+    safeToClean: true,
+    rationale: 'Windows Error Reporting crash archives; diagnostic copies that no longer serve a '
+      + 'purpose once reported. Regenerated only by new crashes.',
+    granularity: 'children',
+  },
+  {
+    kind: 'user-logs',
+    label: '错误报告队列 (%LOCALAPPDATA%\\…\\WER\\ReportQueue)',
+    dir: '%LOCALAPPDATA%\\Microsoft\\Windows\\WER\\ReportQueue',
+    safeToClean: true,
+    rationale: 'Windows Error Reporting entries still queued for upload; reports already sent live '
+      + 'in the archive. Regenerated only by new crashes.',
+    granularity: 'children',
+  },
+  {
+    kind: 'user-logs',
+    label: '崩溃转储 (%LOCALAPPDATA%\\CrashDumps)',
+    dir: '%LOCALAPPDATA%\\CrashDumps',
+    safeToClean: true,
+    rationale: 'Post-mortem process dumps written by WER; useful only while debugging a crash that '
+      + 'is being investigated right now.',
+    granularity: 'children',
+  },
+  {
+    kind: 'user-caches',
+    label: 'WinINet 缓存 (%LOCALAPPDATA%\\…\\INetCache)',
+    dir: '%LOCALAPPDATA%\\Microsoft\\Windows\\INetCache',
+    safeToClean: true,
+    rationale: 'The system-wide WinINet download cache shared by apps that use the Windows HTTP '
+      + 'stack; refetched on demand. (Cookies live in the sibling INetCookies tree and are not '
+      + 'touched.)',
+    granularity: 'children',
+  },
+  {
+    kind: 'user-caches',
+    label: 'DirectX 着色器缓存 (%LOCALAPPDATA%\\D3DSCache)',
+    dir: '%LOCALAPPDATA%\\D3DSCache',
+    safeToClean: true,
+    rationale: 'Compiled shader cache; games recompile it on first launch, costing a one-time '
+      + 'stutter rather than data.',
+    granularity: 'children',
+  },
+  {
+    kind: 'user-caches',
+    label: 'NVIDIA 着色器缓存 (%LOCALAPPDATA%\\NVIDIA\\DXCache)',
+    dir: '%LOCALAPPDATA%\\NVIDIA\\DXCache',
+    safeToClean: true,
+    rationale: 'DirectX shader cache written by the NVIDIA driver; rebuilt on demand.',
+    granularity: 'children',
+  },
+  {
+    kind: 'user-caches',
+    label: 'NVIDIA OpenGL 缓存 (%LOCALAPPDATA%\\NVIDIA\\GLCache)',
+    dir: '%LOCALAPPDATA%\\NVIDIA\\GLCache',
+    safeToClean: true,
+    rationale: 'OpenGL shader cache written by the NVIDIA driver; rebuilt on demand.',
+    granularity: 'children',
+  },
+  {
+    kind: 'user-caches',
+    label: '远程桌面缓存 (%LOCALAPPDATA%\\…\\Terminal Server Client\\Cache)',
+    dir: '%LOCALAPPDATA%\\Microsoft\\Terminal Server Client\\Cache',
+    safeToClean: true,
+    rationale: 'Remote Desktop bitmap cache; rebuilt as the session redraws.',
+    granularity: 'children',
+  },
+  {
+    kind: 'npm-cache',
+    label: 'npm 缓存 (%LOCALAPPDATA%\\npm-cache)',
+    dir: '%LOCALAPPDATA%\\npm-cache',
+    safeToClean: true,
+    rationale: 'Content-addressed tarball cache on Windows (npm\'s `_cacache` equivalent); '
+      + '`npm cache clean --force` equivalent.',
+    granularity: 'whole',
+  },
+  {
+    kind: 'pnpm-store',
+    label: 'pnpm 内容存储 (%LOCALAPPDATA%\\pnpm\\store)',
+    dir: '%LOCALAPPDATA%\\pnpm\\store',
+    safeToClean: false,
+    rationale: 'Hard-link source for every installed dependency; direct deletion breaks linked '
+      + 'node_modules. Run `pnpm store prune` instead.',
+    granularity: 'children',
+  },
+  {
+    kind: 'pip-cache',
+    label: 'pip 缓存 (%LOCALAPPDATA%\\pip\\Cache)',
+    dir: '%LOCALAPPDATA%\\pip\\Cache',
+    safeToClean: true,
+    rationale: 'Wheel download cache; rebuilt on demand.',
+    granularity: 'whole',
+  },
+  {
+    kind: 'uv-cache',
+    label: 'uv 缓存 (%LOCALAPPDATA%\\uv\\cache)',
+    dir: '%LOCALAPPDATA%\\uv\\cache',
+    safeToClean: true,
+    rationale: 'Wheel and source cache; rebuilt on demand.',
+    granularity: 'whole',
+  },
+  {
+    kind: 'yarn-cache',
+    label: 'Yarn 缓存 (%LOCALAPPDATA%\\Yarn\\Cache)',
+    dir: '%LOCALAPPDATA%\\Yarn\\Cache',
+    safeToClean: true,
+    rationale: 'Yarn 1.x package cache; `yarn cache clean` equivalent (on berry installs run that command).',
+    granularity: 'whole',
+  },
+  {
+    kind: 'go-build-cache',
+    label: 'Go 构建缓存 (%LOCALAPPDATA%\\go-build)',
+    dir: '%LOCALAPPDATA%\\go-build',
+    safeToClean: true,
+    rationale: 'Compiled package cache; rebuilt on demand.',
+    granularity: 'whole',
+  },
+  {
+    kind: 'go-mod-cache',
+    label: 'Go 模块缓存 (%USERPROFILE%\\go\\pkg\\mod\\cache)',
+    dir: '%USERPROFILE%\\go\\pkg\\mod\\cache',
+    safeToClean: true,
+    rationale: 'Downloaded module cache (conservative subtree of %USERPROFILE%\\go\\pkg\\mod); '
+      + 're-downloaded on demand.',
+    granularity: 'whole',
+  },
+]
+
+/** Every registry, keyed by the platform that owns it. */
+export const JUNK_TARGETS_BY_PLATFORM: Readonly<Record<string, readonly JunkTarget[]>> = {
+  darwin: JUNK_TARGETS_DARWIN,
+  linux: JUNK_TARGETS_LINUX,
+  win32: JUNK_TARGETS_WIN32,
+}
+
+/** The current platform's registry (the safety asset the tools scan); an
+ * unknown platform falls back to the macOS registry so a scan on an
+ * unsupported host still enumerates something reviewable. */
 export const JUNK_TARGETS: readonly JunkTarget[] =
-  platform() === 'linux' ? JUNK_TARGETS_LINUX : JUNK_TARGETS_DARWIN
+  JUNK_TARGETS_BY_PLATFORM[platform()] ?? JUNK_TARGETS_DARWIN
 
 /**
  * Kinds whose deletion costs non-regenerable data (§3.2 ✅* rows): excluded
@@ -452,16 +730,13 @@ export function isRecommendedItem(item: Pick<JunkItem, 'kind' | 'sizeBytes'>): b
 }
 
 /**
- * Blocked system paths (defense in depth above root containment, guarding
- * against future registry misconfiguration). The list is the UNION of both
- * platforms' red lines — blocking an extra system tree can only refuse more,
- * never allow more — and is evaluated identically everywhere: macOS
- * (`/System`, `/private/var/db`, `~/Library/Containers`…), Linux (`/etc`,
- * `/boot`, `/var/lib` covering dpkg/snapd/flatpak state, `/lib*` covering
- * running kernel modules…). `$HOME` and `~/Library` block equality only —
+ * Blocked POSIX system paths (defense in depth above root containment,
+ * guarding against future registry misconfiguration). The list is the UNION
+ * of the macOS and Linux red lines — blocking an extra system tree can only
+ * refuse more, never allow more. `$HOME` and `~/Library` block equality only —
  * their descendants are where junk lives.
  */
-const BLOCKED_PREFIXES: readonly string[] = [
+const BLOCKED_PREFIXES_POSIX: readonly string[] = [
   '/System', '/usr', '/bin', '/sbin', '/etc', '/boot', '/srv',
   '/private/var/db', '/private/etc', '/Library',
   '/var/log', '/var/lib', '/var/db', '/var/cache',
@@ -469,13 +744,55 @@ const BLOCKED_PREFIXES: readonly string[] = [
   '~/Library/Containers', '~/Library/Group Containers',
 ]
 
+/**
+ * Blocked Windows system trees. Built from the environment rather than
+ * hard-coded to `C:` so a machine whose system drive is `D:` (or whose Program
+ * Files live elsewhere) is still covered; the conventional locations stay as
+ * fallbacks for a stripped-down environment. `$SystemDrive` itself and the
+ * Recycle Bin under it are deliberately absent — the drive root is blocked
+ * separately, and `$Recycle.Bin` is a registry root.
+ */
+export function windowsBlockedPrefixes(env: NodeJS.ProcessEnv = process.env): readonly string[] {
+  const systemDrive = (env.SystemDrive ?? 'C:').replace(/[\\/]+$/, '')
+  const candidates = [
+    env.SystemRoot, env.windir, `${systemDrive}\\Windows`,
+    env.ProgramFiles, env.ProgramW6432, `${systemDrive}\\Program Files`,
+    env['ProgramFiles(x86)'], `${systemDrive}\\Program Files (x86)`,
+    env.ProgramData, `${systemDrive}\\ProgramData`,
+    `${systemDrive}\\Recovery`, `${systemDrive}\\PerfLogs`, `${systemDrive}\\System Volume Information`,
+    `${systemDrive}\\Users\\Default`, `${systemDrive}\\Users\\Public`, `${systemDrive}\\Users\\All Users`,
+  ]
+  const seen = new Set<string>()
+  const prefixes: string[] = []
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string' || candidate.length === 0) continue
+    const normalized = win32.normalize(candidate)
+    const key = normalized.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    prefixes.push(normalized)
+  }
+  return prefixes
+}
+
+/** True when `path` is `prefix` or a descendant of it; case-folded on Windows. */
+function isAtOrUnder(path: string, prefix: string, flavor: PathFlavor): boolean {
+  const p = foldCase(flavor, apiFor(flavor).normalize(path))
+  const b = foldCase(flavor, apiFor(flavor).normalize(prefix))
+  if (p === b) return true
+  const sep = flavor === 'win32' ? '\\' : '/'
+  return p.startsWith(b.endsWith(sep) ? b : `${b}${sep}`)
+}
+
 /** True when a candidate path must never be cleaned, regardless of registry contents. */
-export function isBlockedPath(path: string, home: string): boolean {
-  const p = normalize(path)
-  const h = normalize(home)
+export function isBlockedPath(path: string, home: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const flavor = pathFlavor(path)
+  if (flavor === 'win32') return isBlockedWindowsPath(path, home, env)
+  const p = posix.normalize(path)
+  const h = posix.normalize(home)
   if (p === h || p === `${h}/Library` || p === '/Users' || p === '/home') return true
-  for (const blocked of BLOCKED_PREFIXES) {
-    const b = normalize(blocked.replace(/^~(?=\/)/, h))
+  for (const blocked of BLOCKED_PREFIXES_POSIX) {
+    const b = posix.normalize(blocked.replace(/^~(?=\/)/, h))
     if (p === b || p.startsWith(`${b}/`)) return true
   }
   // Multi-user home roots, both layouts: every home tree except $HOME itself
@@ -492,12 +809,51 @@ export function isBlockedPath(path: string, home: string): boolean {
   return false
 }
 
-/** Expand `~` in every target dir; exported for tests and future filters. */
+/**
+ * The Windows half of {@link isBlockedPath}: the system trees, the drive roots
+ * themselves, and every account tree other than `$HOME`. The multi-user rule
+ * derives the account root from `$HOME`'s parent (rather than assuming
+ * `C:\Users`) but only when that parent really is an account root, so a home
+ * directory inside a deeper tree keeps its own descendants cleanable.
+ */
+function isBlockedWindowsPath(path: string, home: string, env: NodeJS.ProcessEnv): boolean {
+  const p = win32.normalize(path)
+  const h = win32.normalize(home)
+  for (const blocked of windowsBlockedPrefixes(env)) {
+    if (isAtOrUnder(p, blocked, 'win32')) return true
+  }
+  // A bare drive root (`C:\`) is never a reclaimable item.
+  if (p.toLowerCase() === win32.parse(p).root.toLowerCase()) return true
+  if (pathFlavor(home) !== 'win32') return false
+  if (p.toLowerCase() === h.toLowerCase()) return true
+  const accountRoot = win32.dirname(h)
+  const isAccountRoot = win32.basename(accountRoot).toLowerCase() === 'users'
+  if (!isAccountRoot) return false
+  if (p.toLowerCase() === accountRoot.toLowerCase()) return true
+  // Another account's tree, or the shared scaffolding under the account root.
+  return isAtOrUnder(p, accountRoot, 'win32') && !isAtOrUnder(p, h, 'win32')
+}
+
+/**
+ * Expand the placeholders a registry root may carry: a leading `~` becomes
+ * `home` and `%NAME%` becomes the environment value (Windows roots are spelled
+ * that way because the profile, the temp directory, and the system drive are
+ * all relocatable). An unknown `%NAME%` is left verbatim — the root then
+ * simply does not exist, which yields no items rather than a wrong path.
+ * Exported for tests and future filters.
+ */
 export function resolveTargets(
   targets: readonly JunkTarget[] = JUNK_TARGETS,
   home: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
 ): readonly JunkTarget[] {
-  return targets.map(target => ({ ...target, dir: target.dir.replace(/^~(?=\/)/, home) }))
+  return targets.map(target => ({ ...target, dir: expandRoot(target.dir, home, env) }))
+}
+
+/** One registry root through `~`/`%NAME%` expansion. */
+function expandRoot(dir: string, home: string, env: NodeJS.ProcessEnv): string {
+  const withHome = dir.replace(/^~(?=[\\/])/, home)
+  return withHome.replace(/%([^%]+)%/g, (match, name: string) => env[name] ?? match)
 }
 
 /**
@@ -514,17 +870,21 @@ export async function expandGlobs(targets: readonly JunkTarget[]): Promise<reado
 
 async function expandOneTarget(target: JunkTarget): Promise<readonly JunkTarget[]> {
   if (!target.dir.includes('*')) return [target]
-  let currents: string[] = ['/']
-  for (const segment of target.dir.split('/').filter(part => part.length > 0)) {
+  const flavor = pathFlavor(target.dir)
+  const api = apiFor(flavor)
+  const sep = flavor === 'win32' ? '\\' : '/'
+  const root = api.parse(target.dir).root
+  let currents: string[] = [root]
+  for (const segment of target.dir.slice(root.length).split(sep).filter(part => part.length > 0)) {
     const next: string[] = []
     if (segment !== '*') {
-      for (const current of currents) next.push(join(current, segment))
+      for (const current of currents) next.push(api.join(current, segment))
     } else {
       for (const current of currents) {
         try {
           const entries: Dirent[] = await readdir(current, { withFileTypes: true })
           for (const entry of entries) {
-            if (entry.isDirectory()) next.push(join(current, entry.name))
+            if (entry.isDirectory()) next.push(api.join(current, entry.name))
           }
         } catch (error) {
           const code = (error as NodeJS.ErrnoException).code
@@ -582,7 +942,7 @@ async function walkDir(dir: string, depth: number, measure: TreeMeasure, signal?
     return
   }
   for (const entry of entries) {
-    const entryPath = join(dir, entry.name)
+    const entryPath = joinPath(dir, entry.name)
     let entryStat: Stats
     try {
       entryStat = await lstat(entryPath)
@@ -619,11 +979,11 @@ async function mapLimit<T, R>(items: readonly T[], limit: number, task: (item: T
 }
 
 /** Platforms the junk domain supports; everything else is refused whole. */
-const SUPPORTED_PLATFORMS: ReadonlySet<string> = new Set(['darwin', 'linux'])
+const SUPPORTED_PLATFORMS: ReadonlySet<string> = new Set(['darwin', 'linux', 'win32'])
 
-function assertSupportedPlatform(): void {
-  if (!SUPPORTED_PLATFORMS.has(platform())) {
-    throw new PcManagerError('unsupported_platform', 'junk scan/clean support macOS and Linux hosts.')
+function assertSupportedPlatform(plat: NodeJS.Platform = platform()): void {
+  if (!SUPPORTED_PLATFORMS.has(plat)) {
+    throw new PcManagerError('unsupported_platform', 'junk scan/clean support macOS, Linux, and Windows hosts.')
   }
 }
 
@@ -639,6 +999,8 @@ export interface ScanJunkOptions {
   minItemBytes?: number
   /** Abort the walk; aborting fails the whole scan. */
   signal?: AbortSignal
+  /** Overrides the platform gate (default os.platform()); a test seam. */
+  platform?: NodeJS.Platform
 }
 
 /**
@@ -651,7 +1013,7 @@ export async function scanJunk(
   options: ScanJunkOptions = {},
   targets: readonly JunkTarget[] = resolveTargets(),
 ): Promise<JunkScanReport> {
-  assertSupportedPlatform()
+  assertSupportedPlatform(options.platform ?? platform())
   throwIfAborted(options.signal, 'scan')
   const selected = options.kinds === undefined
     ? targets
@@ -720,7 +1082,7 @@ async function scanOneTarget(
     return { items, skipped }
   }
   for (const entry of entries) {
-    const childPath = join(target.dir, entry.name)
+    const childPath = joinPath(target.dir, entry.name)
     const matchedRule = target.protectedChildren?.find(rule => matchesProtectedRule(entry.name, rule))
     if (matchedRule !== undefined) {
       skipped.push({ path: childPath, reason: `protected child (rule: ${matchedRule})` })
@@ -780,7 +1142,9 @@ async function measureWithSkipped(
 
 /**
  * Parse one junk id `<kind>:<absolute path>`; null when the kind is outside
- * the vocabulary or the path is not absolute.
+ * the vocabulary or the path is not absolute in its own flavor. The split is
+ * at the FIRST colon, which is what lets a Windows path keep its drive colon
+ * (`trash:C:\$Recycle.Bin`) — no kind name contains a colon.
  */
 export function parseJunkId(id: string): { kind: JunkKind, path: string } | null {
   const separator = id.indexOf(':')
@@ -788,16 +1152,28 @@ export function parseJunkId(id: string): { kind: JunkKind, path: string } | null
   const kind = id.slice(0, separator) as JunkKind
   const path = id.slice(separator + 1)
   if (!(JUNK_KINDS as readonly string[]).includes(kind)) return null
-  if (!path.startsWith('/')) return null
+  if (!isAbsolutePath(path)) return null
   return { kind, path }
 }
 
-/** Strict descendant check after normalization; equality is not "under". */
+/** Strict descendant check after normalization in the root's own flavor;
+ * equality is not "under". */
 function isStrictlyUnder(path: string, root: string): boolean {
-  const p = normalize(path)
-  const r = normalize(root)
+  const flavor = pathFlavor(root)
+  const api = apiFor(flavor)
+  const p = foldCase(flavor, normalizeLiteral(api, path))
+  const r = foldCase(flavor, normalizeLiteral(api, root))
   if (p === r) return false
-  return p.startsWith(r.endsWith('/') ? r : `${r}/`)
+  const sep = flavor === 'win32' ? '\\' : '/'
+  return p.startsWith(r.endsWith(sep) ? r : `${r}${sep}`)
+}
+
+/** Equality after normalization in the second literal's flavor, case-folded on
+ * Windows (`C:\Users\T` and `c:\users\t` are the same directory there). */
+function samePath(a: string, b: string): boolean {
+  const flavor = pathFlavor(b)
+  const api = apiFor(flavor)
+  return foldCase(flavor, normalizeLiteral(api, a)) === foldCase(flavor, normalizeLiteral(api, b))
 }
 
 /**
@@ -822,7 +1198,7 @@ export async function validateJunkIds(
       throw new PcManagerError('invalid_argument', `unregistered junk kind in id: ${id}`)
     }
     const withinLiteral = targetsOfKind.some(target =>
-      target.granularity === 'whole' ? normalize(path) === normalize(target.dir) : isStrictlyUnder(path, target.dir))
+      target.granularity === 'whole' ? samePath(path, target.dir) : isStrictlyUnder(path, target.dir))
     if (!withinLiteral) {
       throw new PcManagerError('invalid_argument', `path escapes its ${kind} root: ${id}`)
     }
@@ -837,7 +1213,7 @@ export async function validateJunkIds(
     // failure, so realpath errors here fall back to the literal verdict.
     let realPath: string | null = null
     try {
-      realPath = await realpath(normalize(path))
+      realPath = await realpath(normalizePath(path))
     } catch {
       realPath = null
     }
@@ -850,7 +1226,7 @@ export async function validateJunkIds(
           realRoot = await realpath(target.dir)
         } catch { continue /* root vanished; literal verdict stands */ }
         rootsResolved += 1
-        const within = target.granularity === 'whole' ? realPath === realRoot : isStrictlyUnder(realPath, realRoot)
+        const within = target.granularity === 'whole' ? samePath(realPath, realRoot) : isStrictlyUnder(realPath, realRoot)
         if (within) {
           withinReal = true
           break
@@ -882,11 +1258,48 @@ const GIO_TRASH = { bin: '/usr/bin/gio', args: ['trash'] } as const
 /** Timeout for one tier-1 trash invocation. */
 const TRASH_TIMEOUT_MS = 30_000
 
+/**
+ * The Windows tier-1 recycle script for one concrete path list.
+ *
+ * The paths are embedded as PowerShell literals rather than appended as argv:
+ * `-Command` re-joins its arguments with spaces, so a path containing a space
+ * silently splits into two arguments (and a multi-statement script receives
+ * nothing at all in `$args`). Single quotes are the only character PowerShell
+ * needs escaped, doubled inside a single-quoted literal. The .NET
+ * `Microsoft.VisualBasic` recycle API is the same `SendToRecycleBin` the
+ * Explorer shell performs, so recoverable items land in the real Recycle Bin
+ * with their original location. Spelled with `-Command` (never a .ps1 file),
+ * so a Restricted execution policy cannot block it.
+ */
+export function windowsRecycleScript(paths: readonly string[]): string {
+  const literals = paths.map(path => `'${path.replace(/'/g, "''")}'`).join(', ')
+  return [
+    PS_PREAMBLE,
+    "$ErrorActionPreference = 'Stop'",
+    `$targets = @(${literals})`,
+    // A silent no-op would be reported as reclaimed bytes; fail loudly instead
+    // so the caller falls through to the rename tier.
+    "if ($targets.Count -eq 0) { throw 'pc-manager: no recycle targets were passed' }",
+    'Add-Type -AssemblyName Microsoft.VisualBasic',
+    'foreach ($target in $targets) {',
+    '  if ([System.IO.Directory]::Exists($target)) {',
+    "    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($target, 'OnlyErrorDialogs', 'SendToRecycleBin')",
+    '  } else {',
+    "    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($target, 'OnlyErrorDialogs', 'SendToRecycleBin')",
+    '  }',
+    '}',
+  ].join('\n')
+}
+
 /** One resolved tier-1 trash command. */
 export interface TrashCommand {
   bin: string
-  /** Leading argv before the path list (gio needs a `trash` subcommand). */
-  prefixArgs: readonly string[]
+  /**
+   * Full argv for one path list. Built per call because the Windows tier
+   * embeds the paths in its script text (see {@link windowsRecycleScript});
+   * the POSIX tiers simply append them.
+   */
+  buildArgs(paths: readonly string[]): readonly string[]
 }
 
 /** Injectable indirections so tests can exercise every trash tier offline. */
@@ -914,7 +1327,7 @@ const defaultIo: CleanIo = {
   runTrashCommand: async paths => {
     const command = await resolveTrashCommand()
     if (command === null) throw new Error('no trash utility available on this platform')
-    await runFile(command.bin, [...command.prefixArgs, ...paths], { timeout: TRASH_TIMEOUT_MS })
+    await runFile(command.bin, [...command.buildArgs(paths)], { timeout: TRASH_TIMEOUT_MS })
   },
   rename: (from, to) => rename(from, to),
 }
@@ -928,37 +1341,57 @@ async function canExecute(file: string): Promise<boolean> {
   }
 }
 
+/** argv-appending tier-1 command (macOS `trash`, Linux `trash-put`/`gio trash`). */
+function argvTrashCommand(bin: string, prefix: readonly string[] = []): TrashCommand {
+  return { bin, buildArgs: paths => [...prefix, ...paths] }
+}
+
 /** Resolve the platform's tier-1 trash utility by existence probe; null when absent. */
 export async function resolveTrashCommand(plat: NodeJS.Platform = platform()): Promise<TrashCommand | null> {
   if (plat === 'darwin') {
-    return await canExecute(TRASH_BIN) ? { bin: TRASH_BIN, prefixArgs: [] } : null
+    return await canExecute(TRASH_BIN) ? argvTrashCommand(TRASH_BIN) : null
   }
   if (plat === 'linux') {
     for (const bin of LINUX_TRASH_BINS) {
-      if (await canExecute(bin)) return { bin, prefixArgs: [] }
+      if (await canExecute(bin)) return argvTrashCommand(bin)
     }
-    return await canExecute(GIO_TRASH.bin) ? { bin: GIO_TRASH.bin, prefixArgs: GIO_TRASH.args } : null
+    return await canExecute(GIO_TRASH.bin) ? argvTrashCommand(GIO_TRASH.bin, GIO_TRASH.args) : null
+  }
+  if (plat === 'win32') {
+    const bin = await resolvePowershell()
+    if (bin === null) return null
+    return { bin, buildArgs: paths => [...PS_ARGV, windowsRecycleScript(paths)] }
   }
   return null
 }
 
 /** The trash directory faces of one platform: macOS keeps a flat `~/.Trash`;
- * Linux follows the freedesktop spec with `files/` and `info/` subdirs. */
+ * Linux follows the freedesktop spec with `files/` and `info/` subdirs;
+ * Windows' real Recycle Bin is a per-volume `$Recycle.Bin` owned by the shell,
+ * so its tier-2 fallback is a private holding directory inside the profile
+ * (reached only when the shell recycle API is unavailable — the outcome is
+ * still recoverable, just not from the Windows Recycle Bin UI). */
 export interface TrashDirs {
   root: string
-  /** Where trashed items live (equals `root` on macOS). */
+  /** Where trashed items live (equals `root` on macOS and Windows). */
   files: string
-  /** Restore-record directory; null on macOS (no Put Back metadata exists there). */
+  /** Restore-record directory; null where the platform keeps no such metadata. */
   info: string | null
 }
 
-/** The trash layout for `home` under `plat`; exported for tests. */
+/** The trash layout for `home` under `plat`; exported for tests. Joins are
+ * flavor-aware, so a POSIX `home` yields a POSIX layout on any host (and a
+ * Windows `home` yields the profile-relative one). */
 export function trashDirs(plat: NodeJS.Platform, home: string): TrashDirs {
   if (plat === 'linux') {
-    const root = join(home, '.local/share/Trash')
-    return { root, files: join(root, 'files'), info: join(root, 'info') }
+    const root = joinPath(home, '.local/share/Trash')
+    return { root, files: joinPath(root, 'files'), info: joinPath(root, 'info') }
   }
-  const root = join(home, '.Trash')
+  if (plat === 'win32') {
+    const root = joinPath(home, 'AppData/Local/pc-manager/trash')
+    return { root, files: root, info: null }
+  }
+  const root = joinPath(home, '.Trash')
   return { root, files: root, info: null }
 }
 
@@ -966,8 +1399,15 @@ export function trashDirs(plat: NodeJS.Platform, home: string): TrashDirs {
  * Reject a trash-directory face that is not a directory, not ours, or
  * writable by group/others — a world-writable trash destination would let
  * anything intercept "recovered" files. Missing faces are created 0700.
+ *
+ * Ownership and mode bits are POSIX concepts: Windows reports synthesized
+ * modes that say nothing about the ACL, and `process.getuid()` does not exist
+ * there. The Windows faces are therefore only vetted structurally — they sit
+ * inside the account's own profile — and rely on the profile ACL Windows
+ * already enforces.
  */
 async function ensureSafeTrashDirs(dirs: TrashDirs): Promise<void> {
+  const uid = process.getuid?.()
   for (const dir of [dirs.root, dirs.files, dirs.info]) {
     if (dir === null) continue
     let stat: Stats
@@ -979,8 +1419,8 @@ async function ensureSafeTrashDirs(dirs: TrashDirs): Promise<void> {
       continue
     }
     if (!stat.isDirectory()) throw new Error(`${dir} is not a directory`)
-    const uid = process.getuid?.()
-    if (uid === undefined || stat.uid !== uid) throw new Error(`${dir} is not owned by the current user`)
+    if (uid === undefined) continue
+    if (stat.uid !== uid) throw new Error(`${dir} is not owned by the current user`)
     if ((stat.mode & 0o022) !== 0) throw new Error(`${dir} is group- or other-writable`)
   }
 }
@@ -991,13 +1431,13 @@ async function reserveTrashName(dirs: TrashDirs, name: string): Promise<string> 
   for (let attempt = 1; ; attempt += 1) {
     const candidate = attempt === 1 ? name : `${name} ${attempt}`
     const taken = await Promise.all([
-      lstat(join(dirs.files, candidate)).then(() => true, error => {
+      lstat(joinPath(dirs.files, candidate)).then(() => true, error => {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
         throw error
       }),
       dirs.info === null
         ? Promise.resolve(false)
-        : lstat(join(dirs.info, `${candidate}.trashinfo`)).then(() => true, error => {
+        : lstat(joinPath(dirs.info, `${candidate}.trashinfo`)).then(() => true, error => {
             if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
             throw error
           }),
@@ -1014,22 +1454,38 @@ async function reserveTrashName(dirs: TrashDirs, name: string): Promise<string> 
 async function writeTrashInfo(infoDir: string, name: string, originalPath: string): Promise<void> {
   const deletionDate = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
   const content = `[Trash Info]\nPath=${encodeURI(originalPath)}\nDeletionDate=${deletionDate}\n`
-  await writeFile(join(infoDir, `${name}.trashinfo`), content, { mode: 0o600 })
+  await writeFile(joinPath(infoDir, `${name}.trashinfo`), content, { mode: 0o600 })
 }
 
+/** True when the path still exists (symlink-aware; any error reads as gone). */
+async function pathExists(path: string): Promise<boolean> {
+  return lstat(path).then(() => true, () => false)
+}
+
+/**
+ * Move one item to the trash: tier 1 hands it to the platform's shell-aware
+ * utility, tier 2 renames it into the platform's trash layout (adding the
+ * freedesktop restore record where one exists), tier 3 copies across volumes
+ * and removes the source.
+ */
 async function moveToTrash(path: string, home: string, io: CleanIo, tier1Usable: boolean, plat: NodeJS.Platform): Promise<void> {
   if (tier1Usable) {
     try {
       await io.runTrashCommand([path])
-      return
+      // The utility claimed success; confirm the source actually left before
+      // reporting reclaimed bytes. A silent no-op (a policy-blocked shell API,
+      // a helper that ignored its argument list) must fall through to the
+      // rename tier instead of reporting phantom bytes.
+      if (!await pathExists(path)) return
+      throw new Error('the trash utility reported success but the source is still there')
     } catch (error) {
       console.warn(`[pc-manager] trash utility failed, falling back to rename: ${String(error)}`)
     }
   }
   const dirs = trashDirs(plat, home)
   await ensureSafeTrashDirs(dirs)
-  const name = await reserveTrashName(dirs, basename(path))
-  const dest = join(dirs.files, name)
+  const name = await reserveTrashName(dirs, basenamePath(path))
+  const dest = joinPath(dirs.files, name)
   try {
     await io.rename(path, dest)
   } catch (error) {
@@ -1052,13 +1508,15 @@ async function moveToTrash(path: string, home: string, io: CleanIo, tier1Usable:
 /** Remove every child of `dir`, keeping the directory itself. */
 async function emptyDirectory(dir: string): Promise<void> {
   for (const entry of await readdir(dir)) {
-    await rm(join(dir, entry), { recursive: true, force: false })
+    await rm(joinPath(dir, entry), { recursive: true, force: false })
   }
 }
 
 /** Empty the trash kind in place (moving entries of the trash back into the
  * trash would be a no-op): macOS clears the flat root, Linux clears the
- * contents of `files/` and `info/` while keeping the layout directories. */
+ * contents of `files/` and `info/` while keeping the layout directories, and
+ * Windows clears the account's `$Recycle.Bin` folder — which IS the local
+ * "empty the Recycle Bin" operation for that volume. */
 async function emptyTrash(dirs: TrashDirs): Promise<void> {
   await emptyDirectory(dirs.files)
   if (dirs.info !== null) await emptyDirectory(dirs.info)
@@ -1081,12 +1539,12 @@ export async function cleanJunk(
   targets: readonly JunkTarget[] = resolveTargets(),
   options: CleanJunkOptions = {},
 ): Promise<JunkCleanResult> {
-  assertSupportedPlatform()
+  const plat = options.platform ?? platform()
+  assertSupportedPlatform(plat)
   if (ids.length === 0) {
     throw new PcManagerError('invalid_argument', 'cleanJunk requires at least one junk item id.')
   }
   const home = options.home ?? homedir()
-  const plat = options.platform ?? platform()
   const io: CleanIo = { ...defaultIo, ...options.io }
   const expanded = await expandGlobs(targets)
   await validateJunkIds(ids, expanded, home)
@@ -1126,9 +1584,10 @@ export async function cleanJunk(
       if (kind === 'trash') {
         // Emptying the trash is the destructive act itself; its contents have
         // no further trash to go to. The item path IS the registry's trash
-        // root (whole granularity), so the layout derives from it directly.
+        // root (whole granularity on macOS/Linux, the account's own
+        // `$Recycle.Bin` folder on Windows), so the layout derives from it.
         await emptyTrash(plat === 'linux'
-          ? { root: path, files: join(path, 'files'), info: join(path, 'info') }
+          ? { root: path, files: joinPath(path, 'files'), info: joinPath(path, 'info') }
           : { root: path, files: path, info: null })
       } else if (mode === 'delete') {
         await rm(path, { recursive: true, force: false })

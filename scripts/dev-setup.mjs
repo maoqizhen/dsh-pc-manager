@@ -40,7 +40,10 @@ if (existsSync(target)) {
   }
   rmSync(target)
 }
-symlinkSync(pkgRoot, target, 'dir')
+// Windows cannot create a directory symlink without Developer Mode or an
+// elevated token; a junction is the unprivileged equivalent and Node reports
+// it as a symlink, so the idempotency check above keeps working.
+symlinkSync(pkgRoot, target, process.platform === 'win32' ? 'junction' : 'dir')
 console.log(`[dev-setup] linked ${target} -> ${pkgRoot}`)
 
 const build = spawnSync(process.execPath, [path.join(pkgRoot, 'scripts/build.mjs')], { stdio: 'inherit' })

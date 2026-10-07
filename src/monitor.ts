@@ -10,13 +10,14 @@
 import { execFile } from 'node:child_process'
 import type { Dirent } from 'node:fs'
 import { access, constants as fsConstants, readFile, readdir } from 'node:fs/promises'
-import { hostname, loadavg, cpus, freemem, networkInterfaces, platform, totalmem, uptime } from 'node:os'
+import { hostname, loadavg, cpus, freemem, networkInterfaces, platform, release, totalmem, uptime, version } from 'node:os'
 import type { CpuInfo, NetworkInterfaceInfo } from 'node:os'
-import { join } from 'node:path'
+import { join, win32 } from 'node:path'
 import { promisify } from 'node:util'
 import type {
   BatteryStatus, DiskUsage, NetworkInterface, ProcessInfo, ProcessSort, PublicIpGeo, SystemStatus,
 } from './types.ts'
+import { asArray, asNumber, asRecord, asString, parsePowershellJson, PS_ARGV, PS_PREAMBLE, resolvePowershell } from './win32.ts'
 
 const run = promisify(execFile)
 
@@ -38,6 +39,14 @@ const CPU_SAMPLE_MS = 250
  * own clock.
  */
 const DISKSTAT_SAMPLE_MS = 1_000
+
+/**
+ * Windows probe timeout. One facts bundle or process table costs ~2.5 s on a
+ * host with endpoint security (PowerShell startup dominates), so the 5 s
+ * subcommand budget is too tight for a loaded machine — a slow round must
+ * still return a snapshot rather than degrade every field.
+ */
+const WINDOWS_PS_TIMEOUT_MS = 20_000
 
 /** Clamp to one decimal, mapping unparseable input to 0 (percent fields never null). */
 function round1(value: number): number {
@@ -493,10 +502,28 @@ export function parseNvidiaSmiPmon(stdout: string): Map<number, number> {
 /** Cached nvidia-smi existence: probing must not spawn (and warn) every
  * round on hosts without NVIDIA hardware. */
 let nvidiaSmiAvailable: boolean | null = null
+
+/** Where nvidia-smi can live: the Linux toolchain paths, or on Windows the
+ * driver's System32/NVSMI locations plus whatever is on PATH. */
+function nvidiaSmiCandidates(): readonly string[] {
+  if (platform() !== 'win32') return ['/usr/bin/nvidia-smi', '/usr/local/bin/nvidia-smi']
+  const systemRoot = process.env.SystemRoot ?? process.env.windir ?? 'C:\\Windows'
+  const programFiles = process.env.ProgramFiles ?? 'C:\\Program Files'
+  const onPath = (process.env.PATH ?? '')
+    .split(';')
+    .filter(entry => entry.trim().length > 0)
+    .map(entry => win32.join(entry.trim(), 'nvidia-smi.exe'))
+  return [
+    win32.join(systemRoot, 'System32\\nvidia-smi.exe'),
+    win32.join(programFiles, 'NVIDIA Corporation\\NVSMI\\nvidia-smi.exe'),
+    ...onPath,
+  ]
+}
+
 async function hasNvidiaSmi(): Promise<boolean> {
   if (nvidiaSmiAvailable === null) {
     nvidiaSmiAvailable = false
-    for (const bin of ['/usr/bin/nvidia-smi', '/usr/local/bin/nvidia-smi']) {
+    for (const bin of nvidiaSmiCandidates()) {
       if (await access(bin, fsConstants.X_OK).then(() => true, () => false)) {
         nvidiaSmiAvailable = true
         break
@@ -580,6 +607,386 @@ async function readLinuxCpuTemp(): Promise<number | null> {
     }
   }
   return pickCpuTempCelsius(chips)
+}
+
+/* -------------------------------------------------------------------------
+ * Windows probes.
+ *
+ * Windows has no /proc-style text interfaces, so everything the node builtins
+ * cannot see comes from Windows PowerShell — batched into two scripts because
+ * interpreter startup dominates the cost (~2.3 s cold on a host with endpoint
+ * security), and split in two so the volume/network/battery half and the
+ * process table degrade independently. The node builtins still carry the
+ * hot fields (CPU, totals, uptime, OS name): a missing PowerShell leaves a
+ * usable snapshot behind, not an empty one.
+ * ---------------------------------------------------------------------- */
+
+/** One Windows probe bundle: volumes, memory split, per-NIC counters,
+ * whole-disk throughput, GPU engine utilization, battery, firmware thermal
+ * zones, and the process table. Each field degrades to null/[] on its own — a
+ * WMI class that needs elevation or does not exist on the board must not void
+ * the bundle. `processes` already carries the per-pid GPU attribution from
+ * this same bundle (see {@link parseWindowsBundle}). */
+export interface WindowsBundle {
+  osCaption: string | null
+  volumes: DiskUsage[]
+  network: NetworkInterface[]
+  diskBytesPerSec: number | null
+  gpu: WindowsGpuUsage
+  availableBytes: number | null
+  cacheBytes: number | null
+  poolNonpagedBytes: number | null
+  committedBytes: number | null
+  pageFileTotalBytes: number | null
+  pageFileUsedBytes: number | null
+  battery: BatteryStatus | null
+  temperatureCelsius: number | null
+  processes: ProcessInfo[]
+}
+
+/** Utilization rows of one bundle, without the adapter name. */
+export interface WindowsGpuUtilization {
+  /** Busiest engine's utilization 0-100; null when the counter class is
+   * unavailable on this host (as opposed to 0, which is a measured idle GPU). */
+  totalPercent: number | null
+  /** Per-pid utilization 0-100: every engine instance of that process summed,
+   * which is the same reading Task Manager's per-process GPU column shows. */
+  byPid: ReadonlyMap<number, number>
+}
+
+/** GPU face as the Windows GPU performance counters report it. */
+export interface WindowsGpuUsage extends WindowsGpuUtilization {
+  /** Adapter name from `Win32_VideoController` (e.g. `AMD Radeon(TM) Vega 8
+   * Graphics`); null when the class is unreadable. With several adapters the
+   * first installed one is named — the engine counters aggregate every LUID,
+   * so the name is informational, not a partition of the percentages. */
+  name: string | null
+}
+
+/**
+ * The single Windows probe script. Everything rides in one PowerShell round
+ * for two reasons: interpreter startup dominates every query (~2.3 s cold on
+ * a host with endpoint security), and a second concurrent interpreter would
+ * itself show up in the process table it is helping to collect — the script
+ * reports its own `$PID` so the parser can drop that row.
+ *
+ * `ConvertTo-Json` is fed `-InputObject @(…)` because piping unrolls a
+ * one-element array into an object and renders an empty list as an empty
+ * string; field names are pre-flattened so the parser stays shallow.
+ */
+const WINDOWS_BUNDLE_SCRIPT = `${PS_PREAMBLE}
+$volumes = @()
+foreach ($disk in Get-CimInstance Win32_LogicalDisk) {
+  if ($disk.DriveType -notin 2, 3, 4 -or $null -eq $disk.Size) { continue }
+  $volumes += [pscustomobject]@{ deviceId = $disk.DeviceID; fileSystem = $disk.FileSystem; sizeBytes = [int64]$disk.Size; freeBytes = [int64]$disk.FreeSpace }
+}
+$network = @()
+foreach ($nic in Get-CimInstance Win32_PerfRawData_Tcpip_NetworkInterface) {
+  if ($nic.Name -match 'Loopback|isatap|Teredo|Pseudo') { continue }
+  $network += [pscustomobject]@{ name = $nic.Name; rxBytes = [int64]$nic.BytesReceivedPersec; txBytes = [int64]$nic.BytesSentPersec }
+}
+$diskPerf = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk | Where-Object { $_.Name -eq '_Total' } | Select-Object -First 1
+$memory = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory
+$pageFile = Get-CimInstance Win32_PageFileUsage | Select-Object -First 1
+$batteryRaw = Get-CimInstance Win32_Battery | Select-Object -First 1
+$os = Get-CimInstance Win32_OperatingSystem
+$thermal = $null
+$readings = @()
+foreach ($zone in Get-CimInstance -Namespace root/WMI -ClassName MSAcpi_ThermalZoneTemperature) {
+  $celsius = [double]$zone.CurrentTemperature / 10.0 - 273.15
+  if ($celsius -gt -50 -and $celsius -lt 200) { $readings += $celsius }
+}
+if ($readings.Count -gt 0) { $thermal = ($readings | Measure-Object -Maximum).Maximum }
+$diskBytesPerSec = $null
+if ($diskPerf) { $diskBytesPerSec = [double]$diskPerf.DiskBytesPersec }
+$availableBytes = $null
+$cacheBytes = $null
+$poolNonpagedBytes = $null
+$committedBytes = $null
+if ($memory) {
+  $availableBytes = [int64]$memory.AvailableBytes
+  $cacheBytes = [int64]$memory.StandbyCacheNormalPriorityBytes
+  $poolNonpagedBytes = [int64]$memory.PoolNonpagedBytes
+  $committedBytes = [int64]$memory.CommittedBytes
+}
+$pageFileTotalBytes = $null
+$pageFileUsedBytes = $null
+if ($pageFile) {
+  $pageFileTotalBytes = [int64]$pageFile.AllocatedBaseSize * 1MB
+  $pageFileUsedBytes = [int64]$pageFile.CurrentUsage * 1MB
+}
+$battery = $null
+if ($batteryRaw) {
+  $battery = [pscustomobject]@{ percent = $batteryRaw.EstimatedChargeRemaining; status = $batteryRaw.BatteryStatus; runTimeMinutes = $batteryRaw.EstimatedRunTime }
+}
+$osCaption = $null
+if ($os) { $osCaption = $os.Caption }
+$gpuAvailable = $false
+$gpuEngines = @()
+try {
+  $gpuRows = @(Get-CimInstance -ClassName Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -ErrorAction Stop)
+  $gpuAvailable = $true
+  foreach ($engine in $gpuRows) {
+    if ($engine.UtilizationPercentage -gt 0) {
+      $gpuEngines += [pscustomobject]@{ name = $engine.Name; utilization = [double]$engine.UtilizationPercentage }
+    }
+  }
+} catch { $gpuAvailable = $false }
+$gpuAdapterName = $null
+$controller = Get-CimInstance Win32_VideoController | Select-Object -First 1
+if ($controller) { $gpuAdapterName = $controller.Name }
+$now = Get-Date
+$processes = @()
+foreach ($process in Get-Process) {
+  $cpuPercent = $null
+  try {
+    if ($process.StartTime -and $null -ne $process.CPU) {
+      $elapsedSeconds = ($now - $process.StartTime).TotalSeconds
+      if ($elapsedSeconds -gt 0.5) { $cpuPercent = [double]$process.CPU / $elapsedSeconds * 100 }
+    }
+  } catch { $cpuPercent = $null }
+  $command = $null
+  try { $command = $process.Path } catch { $command = $null }
+  $processes += [pscustomobject]@{ pid = [int]$process.Id; name = $process.ProcessName; cpuPercent = $cpuPercent; rssBytes = [int64]$process.WorkingSet64; command = $command }
+}
+$bundle = [pscustomobject]@{
+  samplerPid = $PID
+  osCaption = $osCaption
+  volumes = $volumes
+  network = $network
+  diskBytesPerSec = $diskBytesPerSec
+  gpuCounterAvailable = $gpuAvailable
+  gpuEngines = $gpuEngines
+  gpuAdapterName = $gpuAdapterName
+  availableBytes = $availableBytes
+  cacheBytes = $cacheBytes
+  poolNonpagedBytes = $poolNonpagedBytes
+  committedBytes = $committedBytes
+  pageFileTotalBytes = $pageFileTotalBytes
+  pageFileUsedBytes = $pageFileUsedBytes
+  battery = $battery
+  temperatureCelsius = $thermal
+  processes = $processes
+}
+ConvertTo-Json -InputObject $bundle -Compress -Depth 5`
+
+/**
+ * Project the volume rows of one facts bundle. `mount` is spelled the way
+ * Windows spells it (`C:\`) and `filesystem` carries the real volume name
+ * (NTFS/exFAT/FAT32) instead of a type code.
+ */
+export function parseWindowsVolumes(rows: readonly unknown[]): DiskUsage[] {
+  const volumes: DiskUsage[] = []
+  for (const raw of rows) {
+    const row = asRecord(raw)
+    if (row === null) continue
+    const deviceId = asString(row.deviceId)
+    const totalBytes = asNumber(row.sizeBytes)
+    const freeBytes = asNumber(row.freeBytes)
+    if (deviceId === null || totalBytes === null || freeBytes === null) continue
+    if (totalBytes <= 0 || freeBytes < 0) continue
+    volumes.push({
+      mount: `${deviceId}\\`,
+      filesystem: asString(row.fileSystem) ?? 'unknown',
+      totalBytes,
+      usedBytes: Math.max(0, totalBytes - freeBytes),
+      freeBytes,
+    })
+  }
+  return volumes
+}
+
+/**
+ * Project the per-NIC rows of one facts bundle. Windows keeps cumulative
+ * counters in the raw performance class (its `…Persec` names are the
+ * performance-counter convention, not a rate), so these are the same
+ * since-boot totals `netstat -ib` and /proc/net/dev give on the other two
+ * platforms; duplicate adapter instances keep their `_2` suffix.
+ */
+export function parseWindowsNetwork(rows: readonly unknown[]): NetworkInterface[] {
+  const interfaces: NetworkInterface[] = []
+  for (const raw of rows) {
+    const row = asRecord(raw)
+    if (row === null) continue
+    const name = asString(row.name)
+    const rxBytes = asNumber(row.rxBytes)
+    const txBytes = asNumber(row.txBytes)
+    if (name === null || rxBytes === null || txBytes === null) continue
+    interfaces.push({ interface: name, rxBytes, txBytes })
+  }
+  return interfaces
+}
+
+/** Battery status codes Win32_Battery reports as "on wall power". */
+const WINDOWS_AC_STATUS = new Set([2, 6, 7, 8, 9, 11])
+
+/** …and the subset that means the pack is actively charging. */
+const WINDOWS_CHARGING_STATUS = new Set([6, 7, 8, 9, 11])
+
+/** Win32_Battery's "no estimate" sentinel for EstimatedRunTime. */
+const WINDOWS_UNKNOWN_RUNTIME = 7_158_276
+
+/**
+ * Project the battery row. `powerSource` reuses the macOS/literal strings
+ * (`AC Power` / `Battery Power`) so the dashboard's existing state mapping
+ * keeps working; cycle count and health are not exposed by Win32_Battery
+ * (they need vendor WMI or `powercfg /batteryreport`), so they stay null.
+ */
+export function parseWindowsBattery(row: unknown): BatteryStatus | null {
+  const record = asRecord(row)
+  if (record === null) return null
+  const percent = asNumber(record.percent)
+  const status = asNumber(record.status)
+  if (percent === null && status === null) return null
+  const onAc = status !== null && WINDOWS_AC_STATUS.has(status)
+  const minutes = asNumber(record.runTimeMinutes)
+  return {
+    percent: percent === null ? null : Math.min(100, Math.max(0, Math.round(percent))),
+    charging: status === null ? null : WINDOWS_CHARGING_STATUS.has(status),
+    powerSource: status === null ? null : onAc ? 'AC Power' : 'Battery Power',
+    timeRemainingMinutes: minutes === null || onAc || minutes >= WINDOWS_UNKNOWN_RUNTIME
+      ? null
+      : Math.round(minutes),
+    cycleCount: null,
+    healthPercent: null,
+  }
+}
+
+/**
+ * Project the GPU engine rows of one bundle.
+ *
+ * Windows reports utilization per engine instance, in the
+ * `pid_<pid>_luid_<hi>_<lo>_phys_<n>_eng_<n>_engtype_<type>` naming of the GPU
+ * performance counters, so both faces come out of one vendor-agnostic source
+ * (AMD/Intel/NVIDIA alike — unlike `nvidia-smi`, which only speaks to one
+ * vendor):
+ *
+ * - the headline is the **busiest engine** reading, i.e. the largest per-engine
+ *   sum across processes, clamped to 100 — the same "3D vs Copy vs Video" scale
+ *   Task Manager headlines, rather than a raw sum that would saturate;
+ * - per process, that process's engine instances are summed and clamped, which
+ *   is the reading Task Manager's per-process GPU column shows.
+ *
+ * `available` distinguishes "the counter class exists and the GPU is idle (0)"
+ * from "this host has no such counters (null)": an idle GPU must render as 0%,
+ * not as a missing card.
+ */
+export function parseWindowsGpuEngines(rows: readonly unknown[], available: boolean): WindowsGpuUtilization {
+  const byPid = new Map<number, number>()
+  const byEngine = new Map<string, number>()
+  let sawRow = false
+  for (const raw of rows) {
+    const row = asRecord(raw)
+    if (row === null) continue
+    const name = asString(row.name)
+    const utilization = asNumber(row.utilization)
+    if (name === null || utilization === null || utilization <= 0) continue
+    const pidMatch = /pid_(\d+)/.exec(name)
+    if (pidMatch === null) continue
+    const pid = Number(pidMatch[1])
+    if (!Number.isInteger(pid) || pid <= 0) continue
+    sawRow = true
+    byPid.set(pid, (byPid.get(pid) ?? 0) + utilization)
+    const engine = /engtype_(.+)$/.exec(name)?.[1] ?? 'unknown'
+    byEngine.set(engine, (byEngine.get(engine) ?? 0) + utilization)
+  }
+  for (const [pid, value] of byPid) byPid.set(pid, Math.min(100, round1(value)))
+  const busiest = sawRow ? Math.max(...byEngine.values()) : 0
+  return {
+    totalPercent: available ? Math.min(100, round1(busiest)) : null,
+    byPid,
+  }
+}
+
+/** Parse one probe bundle; null when the payload is not JSON at all. */
+export function parseWindowsBundle(stdout: string, totalMemoryBytes: number): WindowsBundle | null {
+  const root = asRecord(parsePowershellJson(stdout))
+  if (root === null) return null
+  const gpu = {
+    ...parseWindowsGpuEngines(asArray(root.gpuEngines), root.gpuCounterAvailable === true),
+    name: asString(root.gpuAdapterName),
+  }
+  return {
+    osCaption: asString(root.osCaption),
+    volumes: parseWindowsVolumes(asArray(root.volumes)),
+    network: parseWindowsNetwork(asArray(root.network)),
+    diskBytesPerSec: asNumber(root.diskBytesPerSec),
+    gpu,
+    availableBytes: asNumber(root.availableBytes),
+    cacheBytes: asNumber(root.cacheBytes),
+    poolNonpagedBytes: asNumber(root.poolNonpagedBytes),
+    committedBytes: asNumber(root.committedBytes),
+    pageFileTotalBytes: asNumber(root.pageFileTotalBytes),
+    pageFileUsedBytes: asNumber(root.pageFileUsedBytes),
+    battery: parseWindowsBattery(root.battery),
+    temperatureCelsius: asNumber(root.temperatureCelsius),
+    processes: mergeGpuPercent(parseWindowsProcesses(stdout, totalMemoryBytes), gpu.byPid),
+  }
+}
+
+/**
+ * Project the Windows process table. `cpuPercent` is the process's lifetime
+ * average on the single-core scale — the same ps semantics macOS and Linux
+ * report, so the ranking is comparable across platforms — and processes whose
+ * `StartTime`/`CPU` are unreadable (protected system processes) read as 0.
+ */
+export function parseWindowsProcesses(stdout: string, totalMemoryBytes: number): ProcessInfo[] {
+  const root = asRecord(parsePowershellJson(stdout))
+  if (root === null) return []
+  // The sampling PowerShell burns seconds of CPU per round and would headline
+  // every framing of the table; its own `$PID` marks the row to drop.
+  const samplerPid = asNumber(root.samplerPid)
+  const rows: ProcessInfo[] = []
+  for (const raw of asArray(root.processes)) {
+    const row = asRecord(raw)
+    if (row === null) continue
+    const pid = asNumber(row.pid)
+    if (pid === null || !Number.isInteger(pid) || pid <= 0) continue
+    if (samplerPid !== null && pid === samplerPid) continue
+    const rssBytes = asNumber(row.rssBytes) ?? 0
+    const cpuPercent = asNumber(row.cpuPercent) ?? 0
+    rows.push({
+      pid,
+      cpuPercent: round1(Math.max(0, cpuPercent)),
+      memPercent: totalMemoryBytes > 0 ? round1(rssBytes / totalMemoryBytes * 100) : 0,
+      rssBytes,
+      command: asString(row.command) ?? asString(row.name) ?? `pid ${pid}`,
+      netRxBytes: null,
+      netTxBytes: null,
+      gpuPercent: null,
+      diskReadBytes: null,
+      diskWrittenBytes: null,
+    })
+  }
+  return rows
+}
+
+/**
+ * Windows OS name from the node builtins: `os.version()` carries the product
+ * name ("Windows 11 Pro for Workstations") and `os.release()` the build
+ * ("10.0.26300"). Together they are the same "which OS is this" answer
+ * `sw_vers -productVersion` and `/etc/os-release` give on the other platforms
+ * — and unlike the WMI caption they are available even when PowerShell is not.
+ */
+function windowsOsVersion(): string | null {
+  const name = version()
+  const build = release()
+  if (name.length === 0) return build.length > 0 ? build : null
+  return build.length === 0 ? name : `${name} ${build}`
+}
+
+/** Run one PowerShell script, returning its UTF-8 stdout. */
+async function runPowershell(script: string): Promise<string> {
+  const bin = await resolvePowershell()
+  if (bin === null) throw new Error('Windows PowerShell not found')
+  const { stdout } = await run(bin, [...PS_ARGV, script], { timeout: WINDOWS_PS_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 })
+  return stdout
+}
+
+/** Run the Windows probe bundle (null when PowerShell is missing or the
+ * payload is unusable — the caller then keeps its node-builtin numbers). */
+async function readWindowsBundle(totalMemoryBytes: number): Promise<WindowsBundle | null> {
+  return parseWindowsBundle(await runPowershell(WINDOWS_BUNDLE_SCRIPT), totalMemoryBytes)
 }
 
 /**
@@ -1031,22 +1438,29 @@ function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-/** One probe round of the full process table: ps rows merged with the
- * platform's per-process extras — macOS nettop (network); Linux the
- * privileged `ss -tinp` attribution (network, root-gated) and nvidia-smi
- * pmon (GPU SM, presence-gated). Capabilities absent → rows carry nulls and
- * the UI hides the column. */
+/** One probe round of the full process table. macOS shells out for ps plus
+ * nettop (network); Linux reads /proc via ps plus the privileged `ss -tinp`
+ * attribution (network, root-gated) and nvidia-smi pmon (GPU SM,
+ * presence-gated). Windows takes the whole table from one bundle read, whose
+ * own GPU engine counters supply the per-pid GPU attribution — and it must be
+ * the only interpreter spawned this round, since a second concurrent
+ * PowerShell would appear as a row in the very table it helps collect (each
+ * script can only drop its own `$PID`). Capabilities absent → rows carry nulls
+ * and the UI hides the column. */
 export async function mergeProcessTable(): Promise<ProcessInfo[]> {
-  const plat = platform()
+  if (platform() === 'win32') {
+    const bundle = await probe('windows bundle', null as WindowsBundle | null, () => readWindowsBundle(totalmem()))
+    return bundle?.processes ?? []
+  }
+  const onLinux = platform() === 'linux'
   // Linux `comm` truncates to 15 chars; `args` gives the full command line.
-  const psColumns = plat === 'linux' ? 'pid,pcpu,pmem,rss,args' : 'pid,pcpu,pmem,rss,comm'
-  const onLinux = plat === 'linux'
+  const psColumns = onLinux ? 'pid,pcpu,pmem,rss,args' : 'pid,pcpu,pmem,rss,comm'
   const [psRows, netRows, gpuRows] = await Promise.all([
     probe('ps', [] as ProcessInfo[], async () => {
       const { stdout } = await run('ps', ['-Ao', psColumns], { timeout: EXEC_TIMEOUT_MS })
       return parsePs(stdout)
     }),
-    plat === 'darwin'
+    platform() === 'darwin'
       ? probe('nettop', new Map<number, ProcessNetCounters>(), async () => {
           const { stdout } = await run('nettop', ['-P', '-L', '1', '-n', '-J', 'bytes_in,bytes_out'], { timeout: EXEC_TIMEOUT_MS })
           return parseNettop(stdout)
@@ -1084,19 +1498,24 @@ export interface CollectExtras {
 /**
  * Collect one system snapshot. Probes run concurrently and are dispatched by
  * platform: macOS shells out (vm_stat/sysctl/pmset/ioreg/iostat/netstat/
- * sw_vers), Linux reads /proc and /sys. Memory uses the platform's own
- * decomposition (macOS: active+wired+compressed over vm_stat; Linux:
- * MemTotal−MemAvailable over /proc/meminfo) with total−free as the
+ * sw_vers), Linux reads /proc and /sys, Windows takes its hot fields from the
+ * node builtins and the rest from one batched PowerShell facts round. Memory
+ * uses the platform's own decomposition (macOS: active+wired+compressed over
+ * vm_stat; Linux: MemTotal−MemAvailable over /proc/meminfo; Windows:
+ * total−Available over the OS memory counters) with total−free as the
  * documented fallback, so a missing probe degrades instead of failing. The
  * Linux sampling window is padded to a full second for the /proc/diskstats
- * differential.
+ * differential; the Windows PowerShell round spans well over a second on its
+ * own clock, so its CPU differential needs no padding.
  */
 export async function collectStatus(
   maxTop = DEFAULT_TOP_PROCESSES,
   sort: ProcessSort = 'cpu',
   extras?: CollectExtras,
 ): Promise<SystemStatus> {
-  const onLinux = platform() === 'linux'
+  const plat = platform()
+  const onLinux = plat === 'linux'
+  const onWindows = plat === 'win32'
   const cpuStart = cpus()
   const startedAt = Date.now()
   // The first diskstats read precedes every probe so the differential spans
@@ -1104,20 +1523,34 @@ export async function collectStatus(
   const diskstatsStart = onLinux
     ? await probe('diskstats', null as DiskstatSample | null, readDiskstats)
     : null
-  const [disks, processTable, network, gpuPercent, iostatPerSec, pmsetBattery, ioregBattery, swap, vmstat, osVersion, meminfo, linuxBattery, linuxTemp, publicIp] =
+  // The single Windows bundle carries the process table too, so it must be the
+  // only interpreter spawned this round: a second concurrent PowerShell would
+  // both double the cost and show up as a row in the very table it helps
+  // collect (each script can only drop its own `$PID`). `mergeProcessTable` is
+  // still the one-spawn path for callers that want the table alone.
+  const [windowsBundle, posixDisks, mergedProcessTable, posixNetwork, gpuPercent, iostatPerSec, pmsetBattery, ioregBattery, swap, vmstat, osVersionProbe, meminfo, linuxBattery, linuxTemp, publicIp] =
     await Promise.all([
-      probe('df', [] as DiskUsage[], async () => {
-        const { stdout } = await run('df', ['-k'], { timeout: EXEC_TIMEOUT_MS })
-        return parseDf(stdout)
-      }),
-      mergeProcessTable(),
-      onLinux
-        ? probe('netdev', [] as NetworkInterface[], async () => parseProcNetDev(await readFile('/proc/net/dev', 'utf8')))
-        : probe('netstat', [] as NetworkInterface[], async () => {
-            const { stdout } = await run('netstat', ['-ib'], { timeout: EXEC_TIMEOUT_MS })
-            return parseNetstatIb(stdout)
+      onWindows
+        ? probe('windows bundle', null as WindowsBundle | null, () => readWindowsBundle(totalmem()))
+        : Promise.resolve(null as WindowsBundle | null),
+      onWindows
+        ? Promise.resolve([] as DiskUsage[])
+        : probe('df', [] as DiskUsage[], async () => {
+            const { stdout } = await run('df', ['-k'], { timeout: EXEC_TIMEOUT_MS })
+            return parseDf(stdout)
           }),
-      onLinux
+      onWindows
+        ? Promise.resolve([] as ProcessInfo[])
+        : mergeProcessTable(),
+      onWindows
+        ? Promise.resolve([] as NetworkInterface[])
+        : onLinux
+          ? probe('netdev', [] as NetworkInterface[], async () => parseProcNetDev(await readFile('/proc/net/dev', 'utf8')))
+          : probe('netstat', [] as NetworkInterface[], async () => {
+              const { stdout } = await run('netstat', ['-ib'], { timeout: EXEC_TIMEOUT_MS })
+              return parseNetstatIb(stdout)
+            }),
+      onLinux || onWindows
         ? probe('gpu nvidia-smi', null as number | null, async () => {
             if (!await hasNvidiaSmi()) return null
             const { stdout } = await run('nvidia-smi', ['--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'], { timeout: EXEC_TIMEOUT_MS })
@@ -1127,43 +1560,45 @@ export async function collectStatus(
             const { stdout } = await run('ioreg', ['-r', '-d', '1', '-c', 'IOAccelerator'], { timeout: EXEC_TIMEOUT_MS })
             return parseIoregGpu(stdout)
           }),
-      onLinux
+      onLinux || onWindows
         ? Promise.resolve(null as number | null)
         : probe('iostat', null as number | null, async () => {
             const { stdout } = await run('iostat', ['-d', '-c', '2'], { timeout: EXEC_TIMEOUT_MS })
             return parseIostat(stdout)
           }),
-      onLinux
+      onLinux || onWindows
         ? Promise.resolve(null as PmsetBatterySample | null)
         : probe('pmset', null as PmsetBatterySample | null, async () => {
             const { stdout } = await run('pmset', ['-g', 'batt'], { timeout: EXEC_TIMEOUT_MS })
             return parsePmsetBatt(stdout)
           }),
-      onLinux
+      onLinux || onWindows
         ? Promise.resolve(null as IoregBatterySample | null)
         : probe('battery ioreg', null as IoregBatterySample | null, async () => {
             const { stdout } = await run('ioreg', ['-rn', 'AppleSmartBattery'], { timeout: EXEC_TIMEOUT_MS })
             return parseIoregBattery(stdout)
           }),
-      onLinux
+      onLinux || onWindows
         ? Promise.resolve(null as SwapUsage | null)
         : probe('swapusage', null as SwapUsage | null, async () => {
             const { stdout } = await run('sysctl', ['-n', 'vm.swapusage'], { timeout: EXEC_TIMEOUT_MS })
             return parseSwapUsage(stdout)
           }),
-      onLinux
+      onLinux || onWindows
         ? Promise.resolve(null as VmStatUsage | null)
         : probe('vm_stat', null as VmStatUsage | null, async () => {
             const { stdout } = await run('vm_stat', [], { timeout: EXEC_TIMEOUT_MS })
             return parseVmStat(stdout)
           }),
-      onLinux
-        ? probe('os-release', null as string | null, async () => parseOsRelease(await readFile('/etc/os-release', 'utf8')))
-        : probe('sw_vers', null as string | null, async () => {
-            const { stdout } = await run('sw_vers', ['-productVersion'], { timeout: EXEC_TIMEOUT_MS })
-            const version = stdout.trim()
-            return version.length > 0 ? version : null
-          }),
+      onWindows
+        ? Promise.resolve(windowsOsVersion())
+        : onLinux
+          ? probe('os-release', null as string | null, async () => parseOsRelease(await readFile('/etc/os-release', 'utf8')))
+          : probe('sw_vers', null as string | null, async () => {
+              const { stdout } = await run('sw_vers', ['-productVersion'], { timeout: EXEC_TIMEOUT_MS })
+              const value = stdout.trim()
+              return value.length > 0 ? value : null
+            }),
       onLinux
         ? probe('meminfo', null as MeminfoUsage | null, async () => parseMeminfo(await readFile('/proc/meminfo', 'utf8')))
         : Promise.resolve(null as MeminfoUsage | null),
@@ -1179,16 +1614,29 @@ export async function collectStatus(
         ? Promise.resolve(null as PublicIpGeo | null)
         : probe('ip-geo', null as PublicIpGeo | null, extras.ipGeo),
     ])
+  const disks = onWindows ? windowsBundle?.volumes ?? [] : posixDisks
+  const network = onWindows ? windowsBundle?.network ?? [] : posixNetwork
+  // The bundle's rows already carry their per-pid GPU attribution.
+  const processTable = onWindows ? windowsBundle?.processes ?? [] : mergedProcessTable
+  // Windows GPU comes from the engine counters first; a machine whose counter
+  // class is unavailable falls back to nvidia-smi when that binary exists.
+  const gpuUsagePercent = onWindows
+    ? windowsBundle?.gpu.totalPercent ?? gpuPercent
+    : gpuPercent
+  const osVersion = onWindows
+    ? windowsBundle?.osCaption ?? osVersionProbe
+    : osVersionProbe
 
   // The macOS iostat probe already spans ~1s on its own clock; Linux's probes
   // are instant file reads, so its window is padded for the diskstats
-  // differential (and a steadier CPU average).
+  // differential (and a steadier CPU average). The Windows facts round spans
+  // ~2.5s of PowerShell startup, so its window is already wide enough.
   const elapsed = Date.now() - startedAt
   const minWindowMs = onLinux ? DISKSTAT_SAMPLE_MS : CPU_SAMPLE_MS
   if (elapsed < minWindowMs) await delay(minWindowMs - elapsed)
   const cpuEnd = cpus()
 
-  let diskIoPerSec = iostatPerSec
+  let diskIoPerSec = onWindows ? windowsBundle?.diskBytesPerSec ?? null : iostatPerSec
   if (onLinux && diskstatsStart !== null) {
     const end = await probe('diskstats end', null as DiskstatSample | null, readDiskstats)
     if (end !== null) diskIoPerSec = diskstatRate(diskstatsStart, end)
@@ -1228,21 +1676,41 @@ export async function collectStatus(
       ? meminfo.swapTotalBytes - meminfo.swapFreeBytes
       : 0
   }
+  if (windowsBundle !== null) {
+    // Windows memory counters: "Available" already counts the standby list as
+    // reclaimable, which is exactly the MemAvailable notion Linux uses, so
+    // used = total − Available. Standby cache is the cached-files counterpart
+    // and the non-paged pool the closest thing to wired memory (kernel
+    // allocations that can never be paged out). Windows exposes no
+    // compressed-page or purgeable counter → both stay null, and the page file
+    // stands in for swap.
+    const available = windowsBundle.availableBytes
+    usedBytes = available === null || available > total ? fallbackUsed : total - available
+    wiredBytes = windowsBundle.poolNonpagedBytes
+    cachedBytes = windowsBundle.cacheBytes
+    appMemoryBytes = Math.max(0, usedBytes - (wiredBytes ?? 0))
+    compressedBytes = null
+    purgeableBytes = null
+    swapTotalBytes = windowsBundle.pageFileTotalBytes
+    swapUsedBytes = windowsBundle.pageFileUsedBytes
+  }
 
-  const battery: BatteryStatus | null = onLinux
-    ? linuxBattery
-    : pmsetBattery === null && ioregBattery === null ? null : {
-        percent: pmsetBattery?.percent ?? null,
-        charging: pmsetBattery?.charging ?? null,
-        powerSource: pmsetBattery?.powerSource ?? null,
-        timeRemainingMinutes: pmsetBattery?.timeRemainingMinutes ?? null,
-        cycleCount: ioregBattery?.cycleCount ?? null,
-        healthPercent: ioregBattery?.healthPercent ?? null,
-      }
+  const battery: BatteryStatus | null = onWindows
+    ? windowsBundle?.battery ?? null
+    : onLinux
+      ? linuxBattery
+      : pmsetBattery === null && ioregBattery === null ? null : {
+          percent: pmsetBattery?.percent ?? null,
+          charging: pmsetBattery?.charging ?? null,
+          powerSource: pmsetBattery?.powerSource ?? null,
+          timeRemainingMinutes: pmsetBattery?.timeRemainingMinutes ?? null,
+          cycleCount: ioregBattery?.cycleCount ?? null,
+          healthPercent: ioregBattery?.healthPercent ?? null,
+        }
 
   extras?.onProcessTable?.(processTable)
   return {
-    platform: platform(),
+    platform: plat,
     hostname: hostname(),
     osVersion,
     uptimeSeconds: uptime(),
@@ -1250,10 +1718,12 @@ export async function collectStatus(
       model: cpuEnd[0]?.model ?? 'unknown',
       cores: cpuEnd.length,
       usagePercent: cpuUsagePercent(cpuStart, cpuEnd),
-      loadavg: [loadavg()[0], loadavg()[1], loadavg()[2]],
-      temperatureCelsius: linuxTemp,
+      // Windows has no load average; `os.loadavg()` returns zeroes there, which
+      // would read as a genuinely idle machine. The dashboard hides the line.
+      loadavg: onWindows ? null : [loadavg()[0], loadavg()[1], loadavg()[2]],
+      temperatureCelsius: onWindows ? windowsBundle?.temperatureCelsius ?? null : linuxTemp,
     },
-    gpu: { usagePercent: gpuPercent },
+    gpu: { usagePercent: gpuUsagePercent, name: onWindows ? windowsBundle?.gpu.name ?? null : null },
     memory: {
       totalBytes: total,
       usedBytes,

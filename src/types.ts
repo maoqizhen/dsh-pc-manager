@@ -32,9 +32,9 @@ export class PcManagerError extends Error {
   }
 }
 
-/** One mounted volume as reported by `df -k`. */
+/** One mounted volume as reported by `df -k` (macOS/Linux) or Win32_LogicalDisk (Windows). */
 export interface DiskUsage {
-  /** Mount point, e.g. `/` or `/Volumes/LocalData`. */
+  /** Mount point, e.g. `/`, `/Volumes/LocalData`, or a Windows drive root `C:\`. */
   mount: string
   filesystem: string
   totalBytes: number
@@ -116,13 +116,20 @@ export interface SystemStatus {
     cores: number
     /** Whole-system CPU utilization 0–100 over the sampling window; null when unmeasurable. */
     usagePercent: number | null
-    /** 1/5/15-minute load averages. */
-    loadavg: [number, number, number]
+    /** 1/5/15-minute load averages; null on Windows, which has no load average
+     * (the dashboard hides the line rather than printing a fabricated zero). */
+    loadavg: [number, number, number] | null
     /** CPU package temperature °C (Linux hwmon/thermal_zone, capability-gated); null when the host exposes no sensor or the platform needs privileges (macOS powermetrics). */
     temperatureCelsius: number | null
   }
   /** GPU face; `usagePercent` is best-effort via IOAccelerator and often null. */
-  gpu: { usagePercent: number | null }
+  gpu: {
+    usagePercent: number | null
+    /** Adapter name when the host can name it — Windows reads
+     * `Win32_VideoController` (e.g. `AMD Radeon(TM) Vega 8 Graphics`); null on
+     * the platforms whose current GPU source exposes only a percentage. */
+    name: string | null
+  }
   memory: {
     totalBytes: number
     /** active + wired + compressed (documented approximation); falls back to total−free. */

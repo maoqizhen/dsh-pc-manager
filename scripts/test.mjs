@@ -12,6 +12,20 @@ import { fileURLToPath } from 'node:url'
 
 const pkgRoot = realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'))
 
+/**
+ * The harness toolchain binary. pnpm/npm install `.bin/<name>` as an
+ * extensionless shell script plus a `.cmd` shim on Windows — and a `.cmd`
+ * cannot be launched without a shell, so the extension and the shell flag are
+ * both platform-dependent.
+ */
+function toolBin(root, name) {
+  const isWindows = process.platform === 'win32'
+  return {
+    path: path.join(root, 'node_modules', '.bin', isWindows ? `${name}.cmd` : name),
+    isWindows,
+  }
+}
+
 function findHarness() {
   const candidates = [
     process.env.DSH_HARNESS_ROOT,
@@ -20,7 +34,7 @@ function findHarness() {
   ].filter(Boolean)
   for (const root of candidates) {
     if (existsSync(path.join(root, 'package.json'))
-      && existsSync(path.join(root, 'node_modules/.bin/vitest'))) return root
+      && existsSync(toolBin(root, 'vitest').path)) return root
   }
   console.error(`[test] deepseek-harness checkout not found (tried: ${candidates.join(', ')}).`)
   console.error('[test] set DSH_HARNESS_ROOT to the harness root, or check it out beside this repo.')
@@ -28,18 +42,20 @@ function findHarness() {
 }
 
 const harness = findHarness()
-const vitest = spawnSync(
-  path.join(harness, 'node_modules/.bin/vitest'),
+const vitest = toolBin(harness, 'vitest')
+const vitestResult = spawnSync(
+  vitest.path,
   ['run', '--root', pkgRoot],
-  { stdio: 'inherit', cwd: harness },
+  { stdio: 'inherit', cwd: harness, shell: vitest.isWindows },
 )
 let tscStatus = 0
-if (vitest.status === 0) {
-  const tsc = spawnSync(
-    path.join(harness, 'node_modules/.bin/tsc'),
+if (vitestResult.status === 0) {
+  const tsc = toolBin(harness, 'tsc')
+  const tscResult = spawnSync(
+    tsc.path,
     ['--noEmit', '-p', path.join(pkgRoot, 'tsconfig.json')],
-    { stdio: 'inherit', cwd: harness },
+    { stdio: 'inherit', cwd: harness, shell: tsc.isWindows },
   )
-  tscStatus = tsc.status ?? 1
+  tscStatus = tscResult.status ?? 1
 }
-process.exit((vitest.status ?? 1) !== 0 ? vitest.status : tscStatus)
+process.exit((vitestResult.status ?? 1) !== 0 ? vitestResult.status : tscStatus)

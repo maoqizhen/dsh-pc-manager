@@ -6,7 +6,9 @@ DeepSeek Harness (dsh) 的电脑管家插件（官方 bundle 格式），提供�
 右侧边栏仪表盘）、系统垃圾清理（零 LLM 直执行窗口）、软件卸载（M3），共 5 个模型可见工具。
 
 **平台支持**：监控（`pc_status` + 仪表盘）与垃圾清理（`pc_junk_scan`/`pc_junk_clean` + 清理窗口）
-在 **macOS 与 Linux** 上工作；其余平台返回 `unsupported_platform`。
+在 **macOS、Linux 与 Windows** 上工作；其余平台返回 `unsupported_platform`。Windows 侧指标取自
+node 内建 + 单次批量 PowerShell 探针（见[Windows 数据来源](#windows-数据来源)），垃圾注册表为
+`JUNK_TARGETS_WIN32`，回收走真实回收站（Recycle Bin）。
 
 定位是**安全第一**的 agent 系统工具：扫描永远 dry-run；破坏性工具默认 `disabled_by_config`，
 宿主显式开启才动手；回收/卸载默认进废纸篓（可恢复）；id 校验链任一失败**整体拒绝零删除**。
@@ -68,17 +70,25 @@ ln -s "$PWD" ~/.dsh/profiles/web/node_modules/dsh-pc-manager
 
 | 工具 | 功能 | 状态 |
 | --- | --- | --- |
-| `pc_status` | 只读系统快照：CPU/GPU 使用率、负载、温度（能力门控）、内存分解（含 swap）、磁盘 I/O 与各卷占用、电池/电源、网络计数器、多键排序进程表（macOS + Linux；进程级网络/GPU 同为能力门控） | ✅ 已实装 |
-| `pc_junk_scan` | 枚举可回收垃圾（macOS：废纸篓、用户缓存/日志、系统临时、Xcode 产物、模拟器残留、包管理器缓存、iOS 备份；Linux：XDG 回收站、~/.cache、/tmp 与 /var/tmp、包管理器缓存），逐项体积/安全标记/保护排除记录；参数 `kinds` / `minItemBytes`；永远 dry-run | ✅ 已实装 |
-| `pc_junk_clean` | 按 scan 返回的精确 id 回收；结构校验链（格式/根包含/realpath/blocked/safeToClean）任一失败整体拒绝零删除；`trash` kind 原地清空、其余默认三级 trash（macOS：`/usr/bin/trash` → rename `~/.Trash` → 跨卷 cp+rm；Linux：`trash-put`/`gio trash` → freedesktop `~/.local/share/Trash/{files,info}` 带 `.trashinfo` 还原记录 → 跨卷 cp+rm）；量不准不删；需配置显式开启 | ✅ 已实装 |
-| `pc_apps_list` | 已装应用清单（app bundle + Homebrew），含大小/最近使用 | 桩，M3 |
+| `pc_status` | 只读系统快照：CPU/GPU 使用率、负载、温度（能力门控）、内存分解（含 swap）、磁盘 I/O 与各卷占用、电池/电源、网络计数器、多键排序进程表（macOS + Linux + Windows；Windows 无负载均值、进程级网络与磁盘列不可得，见[Windows 数据来源](#windows-数据来源)） | ✅ 已实装 |
+| `pc_junk_scan` | 枚举可回收垃圾（macOS：废纸篓、用户缓存/日志、系统临时、Xcode 产物、模拟器残留、包管理器缓存、iOS 备份；Linux：XDG 回收站、~/.cache、/tmp 与 /var/tmp、包管理器缓存；Windows：账户回收站、%TEMP% 与 %SystemRoot%\Temp、WER 报告与崩溃转储、WinINet/D3D/NVIDIA 着色器/RDP 缓存、包管理器缓存），逐项体积/安全标记/保护排除记录；参数 `kinds` / `minItemBytes`；永远 dry-run | ✅ 已实装 |
+| `pc_junk_clean` | 按 scan 返回的精确 id 回收；结构校验链（格式/根包含/realpath/blocked/safeToClean）任一失败整体拒绝零删除；`trash` kind 原地清空、其余默认三级 trash（macOS：`/usr/bin/trash` → rename `~/.Trash` → 跨卷 cp+rm；Linux：`trash-put`/`gio trash` → freedesktop `~/.local/share/Trash/{files,info}` 带 `.trashinfo` 还原记录 → 跨卷 cp+rm；Windows：`Microsoft.VisualBasic` 回收 API 进**真实回收站** → 退回 `%LOCALAPPDATA%\pc-manager\trash` → 跨卷 cp+rm）；量不准不删；tier-1 报成功但来源仍在则判定失败并降级；需配置显式开启 | ✅ 已实装 |
+| `pc_apps_list` | 已装应用清单（app bundle + Homebrew；Linux 发行版包与 Windows 注册表程序待 M3），含大小/最近使用 | 桩，M3 |
 | `pc_app_uninstall` | 按精确 id 卸载；默认移入废纸篓，残留项报告而非静默删除 | 桩，M3 |
 
 ### 垃圾目标注册表（按平台分派）
 
-注册表结构跨平台共享（`JunkTarget`），条目按平台分派：`JUNK_TARGETS_DARWIN`（18 类 / 19 行）与
-`JUNK_TARGETS_LINUX`（11 类 / 12 行，XDG 布局）；`JUNK_KINDS` 封闭词表跨平台不变（schema 稳定），
-macOS 专属类（user-logs、Xcode/模拟器族、ios-backups）在 Linux 侧无条目。
+注册表结构跨平台共享（`JunkTarget`），条目按平台分派（`JUNK_TARGETS_BY_PLATFORM`）：
+`JUNK_TARGETS_DARWIN`（18 类 / 19 行）与 `JUNK_TARGETS_LINUX`（11 类 / 12 行，XDG 布局）、
+`JUNK_TARGETS_WIN32`（11 类 / 18 行，`%VAR%` 根）；`JUNK_KINDS` 封闭词表三平台不变（schema 稳定），
+平台专属类（user-logs 在 Linux 侧、Xcode/模拟器族与 ios-backups 在 Linux/Windows 侧、
+homebrew-cache 在 Windows 侧）无条目。
+
+**路径风味层**：注册表同时承载 POSIX 与 Windows 字面量，而测试套件在任一主机上都要 pin 三张表，
+因此路径变换一律**按字面量自身的风味**选择 `path.posix`/`path.win32`（`pathFlavor`/`normalizePath`/
+`joinPath`/`isAbsolutePath`/`basenamePath`），而不是按宿主默认——否则在 Windows 上跑测试会把
+POSIX fixture 改写成 `\Users\t\.Trash`。归一化会去掉尾部分隔符（根除外）：`user-caches:/x/.cache/`
+是根自身，不能被当作"根的子项"放行（否则尾斜杠可以清空整个注册表根）。
 
 | Linux 类别 | 目录 | 粒度 | minAge | safe |
 | --- | --- | --- | --- | --- |
@@ -90,12 +100,34 @@ macOS 专属类（user-logs、Xcode/模拟器族、ios-backups）在 Linux 侧�
 
 **命令式回收不进注册表**（延续设计文档 §14）：`apt-get autoremove --purge`（先 `-s` 模拟）、
 `journalctl --vacuum-size=`、snap 旧版本（`snap list --all` 的 disabled 行 → `snap remove
---revision`）、`flatpak uninstall --unused`、`docker system prune` 只作为建议命令报告，不做执行路径。
+--revision`）、`flatpak uninstall --unused`、`docker system prune`、Windows 的
+`Dism /Online /Cleanup-Image /StartComponentCleanup`（WinSxS 组件清理）、
+`SoftwareDistribution\Download`（Windows Update 缓存，需停 `wuauserv`）与 Storage Sense 只作为
+建议命令报告，不做执行路径。
 
-**blocked 红线清单**（两平台并集，防未来注册表误配）：macOS 侧 `/System`、`/usr`、`/private/var/db`、
+| Windows 类别 | 目录 | 粒度 | minAge | safe |
+| --- | --- | --- | --- | --- |
+| `trash` | `%SystemDrive%\$Recycle.Bin` | children（每账户 SID 一个；`WINDOWS_SYSTEM_SIDS` 保护 LocalSystem/LocalService/NetworkService） | — | ✅ |
+| `system-temp` ×2 | `%TEMP%`、`%SystemRoot%\Temp` | children（`WINDOWS_TEMP_PROTECTED` 保护） | 3 天 | ✅ |
+| `user-logs` ×3 | `%LOCALAPPDATA%\…\WER\{ReportArchive,ReportQueue}`、`%LOCALAPPDATA%\CrashDumps` | children | — | ✅ |
+| `user-caches` ×5 | `INetCache`、`D3DSCache`、`NVIDIA\{DXCache,GLCache}`、`Terminal Server Client\Cache` | children | — | ✅ |
+| `npm-cache` / `pnpm-store` | `%LOCALAPPDATA%\npm-cache` / `%LOCALAPPDATA%\pnpm\store`（❌ 建议 `pnpm store prune`） | whole / children | — | ✅ / ❌ |
+| `pip-cache` / `uv-cache` / `yarn-cache` / `go-build-cache` / `go-mod-cache` | `%LOCALAPPDATA%\{pip\Cache,uv\cache,Yarn\Cache,go-build}`、`%USERPROFILE%\go\pkg\mod\cache` | whole | — | ✅ |
+
+**Windows 没有 `user-caches` 伞形行**（刻意）：`%LOCALAPPDATA%` 不是 `~/.cache` 那种缓存目录，
+它混着真实的应用状态（`Packages\*\LocalState`、`Microsoft\Credentials`、浏览器 profile），
+没有一份保护清单能可靠覆盖，因此只登记逐个已知安全的缓存根。同理 `$Recycle.Bin` 用 children
+粒度按账户 SID 分行：别的账户的 SID 目录读不到（降级为 `skipped`），系统账户 SID 由保护清单挡下。
+
+**blocked 红线清单**（三平台并集，防未来注册表误配）：macOS 侧 `/System`、`/usr`、`/private/var/db`、
 `~/Library/Containers` 等原样保留；Linux 侧 `/etc`、`/boot`、`/var/log`、`/var/lib`（含 dpkg/snapd/
-flatpak 状态）、`/var/cache`、`/lib*`（含运行中内核模块）、`/srv`；多用户 home 双布局
-（`/Users` 与 `/home`）下他人目录一律拒绝，`/root` 在非 $HOME 时同样拒绝。
+flatpak 状态）、`/var/cache`、`/lib*`（含运行中内核模块）、`/srv`；Windows 侧的清单**从环境推导**
+（`SystemRoot`/`ProgramFiles`/`ProgramData`/`SystemDrive`，另有常规路径兜底），覆盖
+`%SystemRoot%`、`Program Files`(+x86)、`ProgramData`、`Recovery`、`PerfLogs`、
+`System Volume Information`、`Users\{Default,Public,All Users}`，并额外拒绝**盘符根**（`C:\`）与
+`$HOME` 账户根下的其它账户树（大小写不敏感：Windows 文件系统不区分大小写）；
+`$Recycle.Bin` 本身不在红线上——它是注册表根。
+多用户 home 双布局（`/Users` 与 `/home`）下他人目录一律拒绝，`/root` 在非 $HOME 时同样拒绝。
 
 ## 系统监控指标与数据来源
 
@@ -122,15 +154,51 @@ flatpak 状态）、`/var/cache`、`/lib*`（含运行中内核模块）、`/srv
 | 系统 | 系统版本 | `sw_vers -productVersion` | `/etc/os-release` PRETTY_NAME（如 `Debian GNU/Linux 12 (bookworm)`） | `parseSwVers` / `parseOsRelease` |
 | 进程 | CPU%/内存%(+rss)/网络累计/GPU%；磁盘列预留恒 null | `ps -Ao pid,pcpu,pmem,rss,comm` + `nettop`（CSV/JSON 双兼容） | `ps -Ao pid,pcpu,pmem,rss,args`（Linux comm 截断 15 字符，改用 args）+ `ss -tinp`（root）+ `pmon` | `parsePs` / `parseNettop` / `parseSsTinp` / `mergeProcesses` / `mergeGpuPercent` / `sortProcesses` |
 
+### Windows 数据来源
+
+Windows 既没有 `/proc` 也没有 `df`/`ps`，因此策略是**node 内建扛热字段 + 单次批量 PowerShell 探针
+补其余**：一个 `powershell.exe -NoProfile -NonInteractive -NoLogo -Command` 进程一次取回全部
+（卷、内存分解、网卡计数、磁盘吞吐、电池、温度、进程表），原因是**解释器启动占绝对大头**
+（在有终端安全软件的机器上冷启动 ~2.3 s，每条 WMI 查询只多 30–700 ms），而并发的第二个
+解释器进程本身会污染它正在采集的进程表——脚本把自己的 `$PID` 一并上报，解析侧据此丢掉该行。
+
+| 分组 | 指标 | Windows 来源 | 解析器 |
+| --- | --- | --- | --- |
+| CPU | 使用率/型号/核数 | `node:os`（`os.cpus()` 差分） | `cpuUsagePercent` |
+| CPU | 负载 1/5/15 | **null**（Windows 无负载均值；`os.loadavg()` 恒返回 0，那不是"空闲"而是"没有这个数"，仪表盘隐藏该行） | — |
+| CPU | 封装温度 °C | `root\WMI` `MSAcpi_ThermalZoneTemperature`（0.1 K → °C，多次读数取最大；通常需提权、台式机常无此类 → null，能力门控） | `parseWindowsBundle` |
+| GPU | 使用率 % + 适配器名 | `Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine`——**厂商无关**的引擎计数器（AMD/Intel/NVIDIA 通吃，不像 `nvidia-smi` 只认一家）；整卡口径取**最忙引擎**（该引擎各进程之和，clamp 100，与任务管理器同口径）。适配器名另取 `Win32_VideoController.Name`（如 `AMD Radeon(TM) Vega 8 Graphics`，仪表盘卡片标题）。缺该类时回退 `nvidia-smi --query-gpu`（二进制在场缓存探测） | `parseWindowsGpuEngines` |
+| GPU | 进程级使用率 % | 同一份引擎计数器按 `pid_<pid>_…_engtype_<type>` 归属到进程（该进程所有引擎实例求和，clamp 100 = 任务管理器"进程"页那一列）；缺该类时回退 `nvidia-smi pmon` | `parseWindowsGpuEngines` / `mergeGpuPercent` |
+| 内存 | total/used | node 内建 `os.totalmem()`/`os.freemem()`（后者即 `GlobalMemoryStatusEx` 的"可用"，含 standby，等价 MemAvailable） | — |
+| 内存 | app/wired/cached/swap 分解 | `Win32_PerfFormattedData_PerfOS_Memory`（`AvailableBytes`/`StandbyCacheNormalPriorityBytes`/`PoolNonpagedBytes`/`CommittedBytes`）+ `Win32_PageFileUsage`（页面文件当 swap）；compressed/purgeable 无计数器 → null | `parseWindowsBundle` |
+| 磁盘 | 各卷占用 | `Win32_LogicalDisk`（DriveType 2/3/4，`Size`/`FreeSpace`/`FileSystem`；`mount` 为盘符根 `C:\`） | `parseWindowsVolumes` |
+| 磁盘 | I/O 吞吐 | `Win32_PerfFormattedData_PerfDisk_PhysicalDisk` 的 `_Total` `DiskBytesPersec`（免等待，比 `Get-Counter` 省一次 1 s 采样） | `parseWindowsBundle` |
+| 网络 | 各接口累计 rx/tx | `Win32_PerfRawData_Tcpip_NetworkInterface`（`…Persec` 是性能计数器命名惯例，值是自启动累计；排除 Loopback/isatap/Teredo/Pseudo；重复实例保留 `_2` 后缀） | `parseWindowsNetwork` |
+| 电池 | 电量/充电/电源/剩余时间 | `Win32_Battery`（`BatteryStatus` 2/6/7/8/9/11 = 接电，6–9/11 = 充电中，`powerSource` 复用 macOS 的 `AC Power`/`Battery Power` 字面量；`EstimatedRunTime` 哨兵 71582788 → null）；循环次数/健康度需厂商 WMI 或 `powercfg /batteryreport` → null | `parseWindowsBattery` |
+| 系统 | 系统版本 | `os.version()` + `os.release()`（如 `Windows 11 Pro for Workstations 10.0.26300`；PowerShell 缺席也拿得到），探针在手时用 `Win32_OperatingSystem` 的 Caption 覆盖 | `windowsOsVersion` |
+| 进程 | CPU%/内存%/命令 | `Get-Process`：`cpuPercent = CPU 累计秒 / (now − StartTime) × 100`（**单核口径、进程生命周期平均**，与 ps 语义一致所以排名可跨平台比较；受保护进程读不到 `StartTime`/`CPU` → 0），`memPercent = WorkingSet64 / totalmem`，命令取 `Path`（读不到则回退进程名） | `parseWindowsProcesses` |
+| 进程 | 网络列 | **null，列整列隐藏**——这是 Windows 上唯一补不上的指标：按进程的字节归因需要 ETW 内核网络会话（任务管理器显示该列也是因为它默认以管理员令牌运行），没有零提权来源；全局速率仍由"网络"卡片按接口给出 | — |
+
+**轮次成本与仪表盘节奏**：一次 Windows 采集 = 1 个 PowerShell 进程（~2.5–4.5 s，取决于机器的
+安全软件）+ node 内建（~10 ms）+ 可选的 `nvidia-smi`；pump 会跳过重叠轮次，因此即使
+`dashboardPollMs` 设为 500，Windows 上的实际刷新节奏也就是一轮的耗时（这是平台事实，不做静默
+改写配置）。探针缺席（无 PowerShell）时快照仍可用：CPU/内存总量/运行时长/系统版本全部来自
+node 内建，只有体积、进程表、电池等细节为空。
+
 ### 能力门控探针
 
-三项"检测到能力才启用"的增强（失败不重试探测、不刷 warn，能力缺失即整列/整行 null，UI 相应隐藏）：
+"检测到能力才启用"的增强（失败不重试探测、不刷 warn，能力缺失即整列/整行 null，UI 相应隐藏）：
 
 | 探针 | 门控 | 语义与边界 |
 | --- | --- | --- |
 | 进程网络归因 `ss -tinp` | `process.getuid() === 0` | root 下 `ss -p` 才能归属**全部** socket；非 root 只见自家进程，宁可整列不展示。TCP 口径、当前 socket 求和（socket 关闭计数归零，差分窗口自动丢弃该 pid 的速率，不会出负值/假速率） |
 | 温度 hwmon/thermal_zone | 无需特权，传感器在场即读 | CPU 系芯片名（coretemp/k10temp/zenpower/cpu_*/acpitz/x86_pkg_temp/soc_*）取最大读数；nvme/amdgpu 等不计入；云主机无传感器 → null（CPU 卡温度行隐藏） |
 | 进程 GPU `nvidia-smi pmon` | 二进制在场（`/usr/bin`、`/usr/local/bin` 缓存探测一次） | SM 利用率按 pid 归因；`-` 占位行跳过；多 GPU 取最大。无 NVIDIA 硬件的主机探测一次后永不 spawn |
+| Windows 全量探针（PowerShell 包） | `powershell.exe` 在场（`%SystemRoot%\System32\WindowsPowerShell\v1.0`，缓存探测一次，`pwsh` 7 为备选） | 缺席时降级为 node 内建的"最小快照"（CPU/内存总量/运行时长/系统版本仍在），体积/进程表/电池/网络为空；包内每个字段各自降级（WMI 类缺失或需提权 → null） |
+| Windows GPU 引擎计数器 | `Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine` 类在场（`-ErrorAction Stop` 探测一次；Windows 10 1709+ 有显示适配器即有） | 厂商无关的整卡 + **进程级** GPU 利用率（同一份数据两个口径），并带 `Win32_VideoController` 的适配器名给卡片标题。缺类 → GPU 卡与 GPU 列隐藏，回退 `nvidia-smi`（若在场）。**0% 是"测到的空闲"，null 才是"没有这个能力"** —— 空闲的核显照样出卡片 |
+| Windows 封装温度 | `root\WMI` `MSAcpi_ThermalZoneTemperature` 有读数 | 常见于笔记本且常需提权；台式机/受限环境无此类 → null，CPU 卡温度行隐藏 |
+| Windows 进程级网络 | 无来源（需 ETW 内核会话 / 提权 helper） | 网络列整列隐藏，不用 0 伪造；全局速率仍在"网络"卡 |
+| Windows `nvidia-smi`（回退） | `System32`、`NVIDIA Corporation\NVSMI` 或 PATH 在场缓存探测 | 仅在引擎计数器不可用时才 spawn；与 Linux 同一套解析器（整卡 `--query-gpu` + 进程级 `pmon`） |
 
 ## 仪表盘（右侧边栏）
 
@@ -141,17 +209,23 @@ web profile 的右侧边栏"系统监控"入口（order 30），点开是窄列�
 速率+sparkline）→ 进程表（按 CPU/内存/网络切换，默认前 10；CPU 列表头悬停显示口径说明）。
 手写 SVG，无图表库。
 
-- **能力门控行/列**：CPU 卡温度行（Linux 有传感器才出现）、进程表"网络"列（macOS nettop 恒有；
-  Linux root `ss -tinp` 归因才出现）、"GPU"列（Linux 有 NVIDIA 硬件才出现）——缺能力即隐藏、
-  不摆"—"墙，详见[能力门控探针](#能力门控探针)。进程 CPU% 为**单核口径**（多核进程可超
-  100%）且为 ps 生命周期平均，表头 tooltip 有说明。
+- **能力门控行/列**：CPU 卡温度行（Linux 有传感器 / Windows 有 ACPI 热区才出现）、负载行
+  （Windows 无负载均值，整行隐藏而不是摆 0）、GPU 卡与进程表"GPU"列（Windows 用厂商无关的引擎
+  计数器，AMD/Intel/NVIDIA 都能出；Linux 需 NVIDIA 硬件 + `nvidia-smi`）、进程表"网络"列
+  （macOS nettop 恒有；Linux root `ss -tinp` 归因才出现；Windows 需 ETW，恒隐藏）
+  ——缺能力即隐藏、不摆"—"墙，详见[能力门控探针](#能力门控探针)。磁盘卡在 Windows 上按盘符列出
+  每个卷（`C:\`、`Z:\`……），POSIX 侧仍是 `/` 与 `/Volumes`、`/media`、`/mnt` 下的数据卷。
+  进程 CPU% 为**单核口径**（多核进程可超 100%）且为**进程生命周期平均**（macOS/Linux 来自 ps，
+  Windows 由 `Get-Process` 的累计 CPU 时间除以进程存活时间算得），表头 tooltip 有说明。
 - 数据走同进程 host 半的**单一采集泵 + SSE 推送**：`GET /pc-manager/stream`（text/event-stream）
   是共享基座——host 侧一个定时器（间隔 `dashboardPollMs`，可调 min 500）单路采集并做服务端
   差分（网络速率首帧即有），仪表盘与悬浮窗等所有消费者共享同一条连接、同一帧数据；**无消费者
   时连接与采集自动停止**（引用计数，tab 隐藏/悬浮窗关闭即释放）。`GET /pc-manager/status`
   （`?processSort=&processLimit=`）保留为缓存兜底：与泵同排序（默认 CPU）的请求直接读新鲜
   缓存，其他排序现场采集。LLM 工具 `pc_status` 不经泵、契约不变。
-- headless profile（无 webServer）自动跳过路由注册，工具不受影响。
+- headless profile（无 webServer）自动跳过路由注册，工具不受影响。GPU 卡在有来源时以**适配器名**作标题
+（Windows 从显示适配器读，如 `AMD Radeon(TM) Vega 8 Graphics`；窄列会用省略号截断，完整名在 tooltip 里），
+没有名字来源的平台仍显示通用 `GPU`。
 
 ### 反向代理 / 前缀挂载部署
 
@@ -195,21 +269,35 @@ danger-full-access（`approval: never`）时会话内 ask 被静默自动拒绝�
 
 - **只读工具开箱即用**；两个破坏性工具默认 `disabled_by_config`，宿主在后层 patch 把开关置
   true 才会真正动手。
-- 回收/卸载默认走**废纸篓**（可恢复）；永久删除需 `moveToTrash: false`。trash 落地三级：
+- 回收/卸载默认走**废纸篓**（可恢复；Windows 上即系统"回收站"，两句在本文档中同义）；永久删除需
+  `moveToTrash: false`。trash 落地三级：
   macOS 为 `/usr/bin/trash`（绝对路径调用，防 PATH 劫持）→ 归属校验后的 `~/.Trash` rename（名冲突加
   ` 2`/` 3` 后缀）→ 跨卷 EXDEV 时 cp+rm；Linux 为 `trash-put`/`gio trash`（探测式绝对路径）→
   freedesktop `~/.local/share/Trash/{files,info}` rename + **`.trashinfo` 还原记录**（双面名冲突
-  同步后缀）→ 跨卷 cp+rm；`trash` kind 本身原地清空（搬回废纸篓是无意义的套娃）。
+  同步后缀）→ 跨卷 cp+rm；Windows 为 `Microsoft.VisualBasic.FileIO.FileSystem` 的
+  `SendToRecycleBin`（= 资源管理器同款 shell 回收，落**真实回收站**并记录原位置，可从资源管理器还原；
+  路径以 PowerShell 字面量**内嵌进脚本**而非追加 argv——`-Command` 会用空格重新拼接参数，带空格的
+  路径会被拆成两个参数，多行脚本更是完全收不到 `$args`）→ 退回 `%LOCALAPPDATA%\pc-manager\trash`
+  （profile 内的私有保留区，仍可恢复，只是不在回收站 UI 里）→ 跨卷 cp+rm。tier-1 报成功后**再确认
+  来源确实消失**，否则判失败并降级——静默 no-op（shell API 被策略挡下、参数没绑上）绝不能被当成
+  "已回收 N 字节"上报（Windows 的 E2E 正是这样先抓到了一次假成功）。
+  `trash` kind 本身原地清空（macOS 清空 `~/.Trash`、Linux 清 `files/`+`info/` 内容、Windows 清空本
+  账户的 `%SystemDrive%\$Recycle.Bin\<SID>`——那正是"清空回收站"对该卷的语义）。
+  搬回废纸篓是无意义的套娃。
 - **垃圾清理三层确认**：模型对话确认（工具 description 指引优先 `ask_user_question`）+ 框架
   `tools/pre-execute` 审批闸门（`askBeforeJunkClean` 默认 true，每次必问、无 answerer
   fail-closed）+ id 结构校验链（children 类严格子路径 / whole 类恰为根、双侧 realpath 防符号
   链接重定向、blocked 清单、safeToClean；任一失败**整体拒绝零删除**）。
-- **安全目标注册表**是核心资产：macOS 18 类 / 19 行、Linux 11 类 / 12 行（XDG），含敏感缓存保护
-  清单（密码管理器/IDE/输入法/VPN/同步盘/AI 应用的"缓存"实为不可再生状态，命中记入 `skipped`
-  不出 item）与 EDR/活跃服务前缀保护（企业安全代理缓存删除会触发防篡改告警；Linux 侧另护
-  `systemd-private-*`、`snap-private-tmp`）；`safeToClean:false` 条目只报告不清理，rationale 带
-  建议命令（`xcrun simctl delete unavailable` / `pnpm store prune`）。
-- 领域模块（`src/monitor.ts`、`junk.ts`、`apps.ts`）不依赖 cordis，纯逻辑可独立单测。
+- **安全目标注册表**是核心资产：macOS 18 类 / 19 行、Linux 11 类 / 12 行（XDG）、Windows 11 类 /
+  18 行（`%VAR%` 根），含敏感缓存保护清单（密码管理器/IDE/输入法/VPN/同步盘/AI 应用的"缓存"实为
+  不可再生状态，命中记入 `skipped` 不出 item）与 EDR/活跃服务前缀保护（企业安全代理缓存删除会触发
+  防篡改告警；Linux 侧另护 `systemd-private-*`、`snap-private-tmp`；Windows 侧护 AV/EDR 目录与
+  安装器脚手架）；`safeToClean:false` 条目只报告不清理，rationale 带建议命令
+  （`xcrun simctl delete unavailable` / `pnpm store prune`）。
+- **id 校验用字面量自身的路径风味**：Windows 路径大小写不敏感、以盘符为根，POSIX 路径区分大小写；
+  校验链（根包含 / 相等 / blocked）全部按该路径的风格归一化与比较，因此同一套代码既能校验
+  `C:\Users\t\AppData\Local\Temp\x`，也能校验 `/home/t/.cache/x`。
+- 领域模块（`src/monitor.ts`、`junk.ts`、`apps.ts`、`win32.ts`）不依赖 cordis，纯逻辑可独立单测。
 
 ## 仓库结构
 
@@ -220,15 +308,18 @@ dual-face 包：host 半（工具 + 路由）与浏览器半都吃**已提交的
 ```
 ├── src/
 │   ├── index.ts       插件入口：Config（TS 接口 + Schemastery schema）+ apply；host 半含 webServer 路由
-│   ├── monitor.ts     系统探针与纯解析器（macOS 子命令 + Linux /proc /sys；不依赖 cordis，可独立单测）
-│   ├── junk.ts        垃圾域：双平台安全注册表（darwin/linux）、保护/封锁清单、走查、id 校验链、trash 三级
+│   ├── monitor.ts     系统探针与纯解析器（macOS 子命令 + Linux /proc /sys + Windows 批量 PowerShell 包；不依赖 cordis，可独立单测）
+│   ├── junk.ts        垃圾域：三平台安全注册表（darwin/linux/win32）、路径风味层、保护/封锁清单、走查、id 校验链、trash 三级
+│   ├── win32.ts       Windows 平台设施：PowerShell 发现（缓存 promise，避免并发首调竞态）与容错 JSON 读取器
 │   ├── apps.ts        应用域（M3 桩）
 │   ├── types.ts       领域契约、PcManagerError、封闭错误词表 PcErrorCode
 │   ├── tools.ts       唯一接触 defineTool 的注册层：guarded() 异常→封闭错误联合
 │   └── client/        浏览器半：仪表盘 / 垃圾清理窗口 / 悬浮窗 / locale（值导入仅 react 系）
 ├── lib/               构建产物（已提交：host index.js + client client.js；*.map 忽略）
 ├── tests/             vitest：全部解析器 + 垃圾域全套（注册表逐条 pin、校验链逐层）
-├── scripts/           build / test / dev-setup（一键：链接 profile + 构建）
+│                      + monitor.win32 / junk.win32（Windows 解析器与注册表，宿主无关）
+│                      + e2e.win32（真实主机端到端：快照/扫描/真实回收站往返/HTTP 与工具面/构建产物）
+├── scripts/           build / test / dev-setup（一键：链接 profile + 构建；跨平台解析 .bin/.cmd shim）
 ├── bundle.patch.yml   bundle 层（dsh.plugin add 时应用；安全默认，破坏性工具关闭）
 ├── cordis.patch.yml   开发 overlay（--patch 挂载，含本地 dogfooding 的开关配置）
 ├── tsdown.config.ts   双 entry 构建（host ESM + client CJS 工件契约）
@@ -241,6 +332,13 @@ dual-face 包：host 半（工具 + 路由）与浏览器半都吃**已提交的
 前置：本仓库与 [deepseek-harness](../deepseek-harness) **并列检出**（或嵌套在上一层的工作区
 目录里，或用 `DSH_HARNESS_ROOT` 环境变量指认）。工具链（tsdown / vitest / tsc）全部借 harness
 侧解析，本仓库**不要 `pnpm install`**，也没有任何 `node_modules`。
+
+> **没有 harness 检出也能验证**：`scripts/test.mjs` 只要求 `DSH_HARNESS_ROOT` 指向一个含
+> `package.json` 且装了 `vitest`/`tsc` 的目录，`tsconfig.json` 的 paths 也按同一套约定解析
+> `@deepseek-ai/*`。因此可以自己搭一个"工具链替身"（`npm i vitest typescript @types/node
+> @types/react react react-dom tsdown` + 按 `tsconfig.json` 里的嵌套路径做 junction），
+> 本仓库的 Windows 支持就是这样验证的（tsdown 0.23 / vitest 3.2 / TypeScript 6.0，
+> `@deepseek-ai/*` 取 0.2.0-rc.2 系列）。
 
 一键 dev 安装（链接进 profile 的 node_modules + 构建产物，幂等）：
 
@@ -258,16 +356,34 @@ pnpm dsh --patch ../dsh-pc-manager/cordis.patch.yml --profile web
 测试与类型检查：
 
 ```sh
-npm test                         # vitest（122 specs，root 环境自动跳过 4 个 EACCES 用例）+ tsc --noEmit，均借 harness 二进制
+npm test                         # vitest（182 specs：176 通过 + 6 平台跳过）+ tsc --noEmit，均借 harness 二进制
 ```
+
+**跨平台工具链说明**：`scripts/{build,test}.mjs` 在 Windows 上会自动改指 `.bin/<name>.cmd` 并以
+`shell: true` 启动（`node_modules/.bin` 里的无扩展名 shim 在 Windows 上不可直接执行），
+`scripts/dev-setup.mjs` 用 **junction** 代替目录符号链接（Windows 建符号链接需要开发者模式或提权）。
+`tsc` 需要 TypeScript 6+：`tsconfig.json` 里的 `ignoreDeprecations: "6.0"` 在 5.x 上会直接报
+`TS5103`。
 
 覆盖全部纯解析器（df 双平台含 Linux 伪文件系统过滤/ps/vm_stat/meminfo/swapusage/os-release/
 pmset/ioreg 电池与 GPU/nvidia-smi 整卡+pmon 进程级/iostat/diskstats 速率差分/netstat/net-dev/
 nettop CSV+JSON/ss -tinp 归因/power_supply uevent/温度芯片选路/进程与 GPU 合并排序/CPU 差分）
-与垃圾域全套（双平台注册表与保护清单逐条 pin、glob 展开、走查统计、scan 语义、校验链逐层含
-符号链接重定向、整体拒绝、双平台 trash 三级（含 .trashinfo 还原记录与冲突后缀同步）、blocked
-红线并集、量不准不删、审批摘要 en/zh 快照）。权限降级（EACCES）用例需非 root 运行器，root 下
-自动跳过（root 的 DAC override 读穿 0000 权限）。
+与垃圾域全套（三平台注册表与保护清单逐条 pin、glob 展开、走查统计、scan 语义、校验链逐层含
+符号链接重定向与尾斜杠根逃逸、整体拒绝、三平台 trash 三级（含 `.trashinfo` 还原记录与冲突后缀
+同步）、blocked 红线并集、量不准不删、审批摘要 en/zh 快照），加上 Windows 专属解析器（
+`Win32_LogicalDisk` 卷行、`PerfRawData_Tcpip_NetworkInterface` 网卡行、`Win32_Battery` 状态码与
+`EstimatedRunTime` 哨兵、`Get-Process` 进程行与采样进程自剔除、包级降级）与 Windows 路径风味/
+红线/校验用例。
+
+**端到端（`tests/e2e.win32.spec.ts`）**——不注入任何东西：真实主机上跑 `collectStatus` 并断言快照
+自洽（卷算术闭合、内存不超总量、本进程在进程表里、`loadavg` 为 null）；真实注册表只读扫描；
+**真实回收站往返**（把一个 fixture 文件交给 shell 回收，再从 `$Recycle.Bin` 的 `$I`/`$R` 记录里把
+它找出来验证原位置，然后只删这一条、不动用户既有回收站内容）；真实 delete 模式；用桩 cordis
+上下文跑真实 `apply()` 并打 `/pc-manager/{status,junk/scan,junk/clean}` 四个面（含 405/400/403
+拒绝路径）与五个工具；最后加载**已提交的 `lib/` 产物**（host 与 client 两个工件）核对契约——这条
+会在源码改了但忘记 `npm run build` 时失败。权限降级（EACCES）用例需 POSIX 权限语义，root 或
+Windows 上自动跳过（root 的 DAC override 读穿 0000 权限，Windows 的 `chmod` 只切只读属性、
+挡不住读取）。
 
 **发布约定**：改完源码必须 `npm run build` 并把 `lib/*.js` 一并提交——git 安装直接加载已提交
 产物，不跑任何构建脚本（这也是免掉 pnpm ≥10 构建授权的方式）。构建工具链注意：`scripts/build.mjs`
@@ -307,11 +423,25 @@ nettop CSV+JSON/ss -tinp 归因/power_supply uevent/温度芯片选路/进程与
   归因 SM 利用率（二进制在场缓存探测，缺席不 spawn 不刷 warn）；CPU 封装温度读
   `/sys/class/hwmon` 回退 `/sys/class/thermal`（CPU 系芯片取最大，`cpu.temperatureCelsius` 进
   schema 与 CPU 卡片）；`pc_status` description 同步。
+- **M2.11（完成，2026-10-07）**：Windows 平台支持 —— 监控侧 node 内建扛热字段（CPU 差分、
+  内存总量/可用、运行时长、`os.version()`+`os.release()` 系统名）+ **单次批量 PowerShell 探针**
+  （`Win32_LogicalDisk` 卷、`PerfOS_Memory` 内存分解、页面文件当 swap、`PerfRawData_Tcpip_NetworkInterface`
+  网卡、`PerfDisk_PhysicalDisk` 吞吐、`GPUPerformanceCounters_GPUEngine` 厂商无关 GPU 引擎
+  （整卡"最忙引擎"口径 + 按 pid 归因的进程级 GPU，缺类回退 `nvidia-smi`）、`Win32_Battery`、
+  `MSAcpi_ThermalZoneTemperature`、`Get-Process` 进程表，脚本自报 `$PID` 让采样进程从自己的进程表里
+  消失）；`loadavg` 改为可空（Windows 无负载均值，仪表盘隐藏该行而不是显示假 0）；垃圾侧
+  `JUNK_TARGETS_WIN32`（11 类 / 18 行 `%VAR%` 根，回收站按账户 SID 分行）与 Windows 红线（环境推导的
+  系统目录 + 盘符根 + 他人账户树，大小写不敏感）；**路径风味层**（按字面量自身风格选 posix/win32，
+  并顺带修掉 POSIX 侧尾斜杠可把注册表根当成"根的子项"清空的漏洞）；trash 三级 Windows 落地
+  （真实回收站 → profile 私有保留区 → 跨卷 cp+rm）与 tier-1 结果复核；`scripts/*` 跨平台化
+  （`.cmd` shim + junction）；新增 60 条 Windows 用例与 9 条真实主机 E2E（含回收站往返、GPU 能力
+  一致性断言与 `lib/` 产物契约）。**唯一补不上的指标**是按进程网络归因（需 ETW 内核会话，无零提权
+  来源），该列在 Windows 上按能力门控隐藏。
 - **M3（规划中）**：应用清单与卸载 —— macOS `/Applications` bundle 走查（du + kMDItemLastUseDate）、
   `brew list` 合并、移废纸篓卸载、残留项（plist/`App Support`/缓存）报告；Linux 侧
-  `dpkg-query` 清单与 `rc` 残留清理为后续候选。
+  `dpkg-query` 清单与 `rc` 残留清理、Windows 侧注册表 Uninstall 键 + `%ProgramFiles%` 走查为后续候选。
 - **未排期**：macOS 温度（`powermetrics` 需 sudo，不代跑）、进程级磁盘真实取数（需特权
-  helper）、Windows、pnpm store 引用计数感知清理、用户持久排除清单。
+  helper）、Windows 进程级网络归因（需 ETW）、pnpm store 引用计数感知清理、用户持久排除清单。
 
 ## License
 

@@ -15,8 +15,9 @@ import { platform } from 'node:os'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
-  EDR_PROTECTED_PREFIXES, JUNK_KINDS, JUNK_TARGETS, JUNK_TARGETS_DARWIN, JUNK_TARGETS_LINUX, LINUX_PROTECTED_CHILDREN,
-  LINUX_TEMP_PROTECTED, PROTECTED_CHILDREN, cleanJunk, computeRecommendedPlan, describeJunkIds, expandGlobs,
+  EDR_PROTECTED_PREFIXES, JUNK_KINDS, JUNK_TARGETS, JUNK_TARGETS_DARWIN, JUNK_TARGETS_LINUX, JUNK_TARGETS_WIN32,
+  LINUX_PROTECTED_CHILDREN, LINUX_TEMP_PROTECTED, PROTECTED_CHILDREN, WINDOWS_SYSTEM_SIDS, WINDOWS_TEMP_PROTECTED,
+  cleanJunk, computeRecommendedPlan, describeJunkIds, expandGlobs,
   isBlockedPath, isRecommendedItem, matchesProtectedRule, measureTree, parseJunkId, resolveTargets, resolveTrashCommand,
   scanJunk, trashDirs, validateJunkIds,
 } from '../src/junk.ts'
@@ -52,6 +53,17 @@ async function put(path: string, bytes: number): Promise<void> {
   await writeFile(path, Buffer.alloc(bytes, 1))
 }
 
+/**
+ * Create a directory link to `target`. POSIX uses a symlink; Windows uses a
+ * directory junction, which is the unprivileged equivalent — a real symlink
+ * needs Developer Mode or an elevated token. Node reports both as symlinks
+ * (`lstat().isSymbolicLink()`), so the walk's no-follow rule and the realpath
+ * defense are exercised identically on all three platforms.
+ */
+async function linkDir(target: string, path: string): Promise<void> {
+  await (platform() === 'win32' ? symlink(target, path, 'junction') : symlink(target, path))
+}
+
 /** A fresh fake home with a sane trash layout for the platform (0700, owned by the runner). */
 async function freshHome(plat: NodeJS.Platform = 'darwin'): Promise<string> {
   homeSeq += 1
@@ -70,11 +82,13 @@ const noTrashBin = {
 }
 
 /**
- * Permission-degradation tests need a non-root runner: root's
- * CAP_DAC_OVERRIDE reads straight through 0000 modes, so the EACCES premise
- * cannot be reproduced (design doc §11 anticipated "root 下 skip").
+ * Permission-degradation tests need POSIX permission semantics: root's
+ * CAP_DAC_OVERRIDE reads straight through 0000 modes, and Windows `chmod`
+ * only toggles the read-only attribute (it cannot deny read through the ACL),
+ * so the EACCES premise holds on neither (design doc §11 anticipated
+ * "root 下 skip").
  */
-const itNeedsNonRoot = process.getuid?.() === 0 ? it.skip : it
+const itNeedsPosixPermissions = process.platform === 'win32' || process.getuid?.() === 0 ? it.skip : it
 
 describe('registry and protection lists', () => {
   it('registers the macOS registry as 19 rows over 18 kinds with the intended safety split', () => {
@@ -100,8 +114,46 @@ describe('registry and protection lists', () => {
     }
   })
 
+  it('registers the Windows registry as 18 rows over 11 kinds on %VAR% roots', () => {
+    expect(JUNK_TARGETS_WIN32).toHaveLength(18)
+    expect(new Set(JUNK_TARGETS_WIN32.map(row => row.kind)).size).toBe(11)
+    expect(JUNK_TARGETS_WIN32.filter(row => row.kind === 'system-temp').map(row => row.dir))
+      .toEqual(['%TEMP%', '%SystemRoot%\\Temp'])
+    expect(JUNK_TARGETS_WIN32.filter(row => row.kind === 'trash')[0]?.dir).toBe('%SystemDrive%\\$Recycle.Bin')
+    expect(JUNK_TARGETS_WIN32.filter(row => row.kind === 'trash')[0]?.granularity).toBe('children')
+    expect(JUNK_TARGETS_WIN32.filter(row => row.kind === 'trash')[0]?.protectedChildren).toBe(WINDOWS_SYSTEM_SIDS)
+    const unsafe = [...new Set(JUNK_TARGETS_WIN32.filter(row => !row.safeToClean).map(row => row.kind))]
+    expect(unsafe).toEqual(['pnpm-store'])
+    // macOS-only and Homebrew kinds never appear as Windows rows (user-logs
+    // does: WER archives and crash dumps are the Windows analogue).
+    for (const absent of ['xcode-derived-data', 'xcode-archives', 'xcode-ios-device-support',
+      'xcode-simulator-caches', 'simulator-unavailable-devices', 'ios-backups', 'homebrew-cache']) {
+      expect(JUNK_TARGETS_WIN32.some(row => row.kind === absent)).toBe(false)
+    }
+    expect(JUNK_TARGETS_WIN32.filter(row => row.kind === 'user-logs')).toHaveLength(3)
+    // Every Windows root is either %VAR%-anchored or profile-anchored — never
+    // a bare drive-relative literal.
+    for (const row of JUNK_TARGETS_WIN32) {
+      expect(row.dir.startsWith('%') || row.dir.startsWith('~')).toBe(true)
+    }
+    const tempRows = JUNK_TARGETS_WIN32.filter(row => row.kind === 'system-temp')
+    expect(tempRows.every(row => row.protectedChildren === WINDOWS_TEMP_PROTECTED && row.minAgeDays === 3)).toBe(true)
+  })
+
+  it('pins the Windows temp protection list (live installers and EDR)', () => {
+    expect(WINDOWS_TEMP_PROTECTED).toEqual([
+      'CrowdStrike', 'CSFalcon', 'SentinelOne', 'Sentinel', 'Sophos', 'Tanium', 'CarbonBlack', 'CbDefense',
+      'mde', 'MsMpEng', 'MpCmdRun', 'MpEngine', 'Defender', 'avast', 'AVG', 'ESET', 'Kaspersky',
+      'scoped_dir', 'chrome_installer', 'VSIXInstaller', 'Microsoft Visual Studio', 'Roslyn',
+    ])
+    expect(WINDOWS_SYSTEM_SIDS).toEqual(['S-1-5-18', 'S-1-5-19', 'S-1-5-20'])
+  })
+
   it('dispatches JUNK_TARGETS by the runtime platform', () => {
-    expect(JUNK_TARGETS).toBe(platform() === 'linux' ? JUNK_TARGETS_LINUX : JUNK_TARGETS_DARWIN)
+    const expected = platform() === 'linux' ? JUNK_TARGETS_LINUX
+      : platform() === 'win32' ? JUNK_TARGETS_WIN32
+        : JUNK_TARGETS_DARWIN
+    expect(JUNK_TARGETS).toBe(expected)
   })
 
   it('pins every sensitive-cache protection rule (macOS)', () => {
@@ -235,7 +287,7 @@ describe('measureTree', () => {
     await put(join(root, 'sub/b.bin'), 50)
     await put(join(root, 'sub/deep/c.bin'), 25)
     await put(join(base, 'walk-outside-target'), 10_000)
-    await symlink(join(base, 'walk-outside-target'), join(root, 'sub/link'))
+    await linkDir(join(base, 'walk-outside-target'), join(root, 'sub/link'))
     const { sizeBytes: linkSize } = await measureTree(join(root, 'sub/link'))
     const measure = await measureTree(root)
     expect(measure.sizeBytes).toBe(100 + 50 + 25 + linkSize)
@@ -256,7 +308,7 @@ describe('measureTree', () => {
     expect(stale.maxMtimeMs).toBe(old.getTime())
   })
 
-  itNeedsNonRoot('records permission-degraded subtrees instead of failing the walk', async () => {
+  itNeedsPosixPermissions('records permission-degraded subtrees instead of failing the walk', async () => {
     const root = join(base, 'walk-eacces')
     await put(join(root, 'top.bin'), 10)
     await put(join(root, 'locked/inner.bin'), 999)
@@ -362,7 +414,7 @@ describe('scanJunk', () => {
     expect(report.totalBytes).toBe(0)
   })
 
-  itNeedsNonRoot('records permission-degraded children as skipped without an item', async () => {
+  itNeedsPosixPermissions('records permission-degraded children as skipped without an item', async () => {
     const caches = join(base, 'scan-eacces-child')
     await put(join(caches, 'locked/inner'), 500)
     await chmod(join(caches, 'locked'), 0o000)
@@ -406,7 +458,7 @@ describe('validateJunkIds', () => {
   it('rejects symlink redirects that escape the root after realpath', async () => {
     const outside = join(base, 'validate-outside')
     await put(join(outside, 'secret'), 1)
-    await symlink(outside, join(caches, 'redirect'))
+    await linkDir(outside, join(caches, 'redirect'))
     const expanded = await expandGlobs([target('user-caches', caches)])
     await expect(validateJunkIds([`user-caches:${join(caches, 'redirect')}`], expanded, home))
       .rejects.toMatchObject({ code: 'invalid_argument' })
@@ -533,7 +585,9 @@ describe('cleanJunk', () => {
     expect(existsSync(join(home, '.local/share/Trash/files/item 2/f'))).toBe(true)
     const record = await readFile(join(home, '.local/share/Trash/info/item 2.trashinfo'), 'utf8')
     expect(record).toContain('[Trash Info]')
-    expect(record).toContain(`Path=${join(caches, 'item')}`)
+    // The spec stores the original path percent-encoded, so a Windows path
+    // legitimately carries %5C separators here.
+    expect(record).toContain(`Path=${encodeURI(join(caches, 'item'))}`)
     expect(record).toMatch(/DeletionDate=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/)
     expect(result.totalReclaimedBytes).toBe(128)
   })
@@ -557,7 +611,7 @@ describe('cleanJunk', () => {
     expect(existsSync(join(home, '.Trash', 'item', 'f'))).toBe(true)
   })
 
-  it('refuses an unsafe ~/.Trash and leaves the item untouched', async () => {
+  itNeedsPosixPermissions('refuses an unsafe ~/.Trash and leaves the item untouched', async () => {
     const home = await freshHome('darwin')
     await chmod(join(home, '.Trash'), 0o020)
     const caches = join(base, 'clean-badtrash')
@@ -576,7 +630,7 @@ describe('cleanJunk', () => {
     }
   })
 
-  it('refuses a group-writable freedesktop files face (linux)', async () => {
+  itNeedsPosixPermissions('refuses a group-writable freedesktop files face (linux)', async () => {
     const home = await freshHome('linux')
     const filesFace = join(home, '.local/share/Trash/files')
     await chmod(filesFace, 0o770)
@@ -606,7 +660,7 @@ describe('cleanJunk', () => {
     expect(existsSync(join(caches, 'item'))).toBe(false)
   })
 
-  itNeedsNonRoot('refuses items whose re-measure is incomplete, leaving them untouched', async () => {
+  itNeedsPosixPermissions('refuses items whose re-measure is incomplete, leaving them untouched', async () => {
     const caches = join(base, 'clean-degraded-child')
     await put(join(caches, 'item/ok'), 16)
     await put(join(caches, 'item/locked/inner'), 999)
@@ -638,7 +692,7 @@ describe('cleanJunk', () => {
     expect(result.totalReclaimedBytes).toBe(2)
   })
 
-  itNeedsNonRoot('skips items it cannot re-measure, leaving them untouched', async () => {
+  itNeedsPosixPermissions('skips items it cannot re-measure, leaving them untouched', async () => {
     const caches = join(base, 'clean-unmeasurable')
     await put(join(caches, 'item/inner'), 800)
     await chmod(join(caches, 'item'), 0o000)
@@ -704,10 +758,21 @@ describe('trash layout and tier-1 resolution', () => {
       files: '/home/t/.local/share/Trash/files',
       info: '/home/t/.local/share/Trash/info',
     })
+    expect(trashDirs('win32', 'C:\\Users\\t')).toEqual({
+      root: 'C:\\Users\\t\\AppData\\Local\\pc-manager\\trash',
+      files: 'C:\\Users\\t\\AppData\\Local\\pc-manager\\trash',
+      info: null,
+    })
+    expect(trashDirs('darwin', 'C:\\Users\\t')).toEqual({
+      root: 'C:\\Users\\t\\.Trash',
+      files: 'C:\\Users\\t\\.Trash',
+      info: null,
+    })
   })
 
   it('resolves no tier-1 trash utility on unsupported platforms', async () => {
-    await expect(resolveTrashCommand('win32')).resolves.toBeNull()
+    await expect(resolveTrashCommand('freebsd')).resolves.toBeNull()
+    await expect(resolveTrashCommand('aix')).resolves.toBeNull()
   })
 })
 

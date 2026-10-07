@@ -62,7 +62,7 @@ const STATUS_SCHEMA = {
         model: { type: 'string', required: true },
         cores: { type: 'number', required: true },
         usagePercent: nullable({ type: 'number' }),
-        loadavg: { type: 'array', required: true, items: { type: 'number' } },
+        loadavg: { oneOf: [{ type: 'array', items: { type: 'number' } }, { type: 'null' as const }], required: true },
         temperatureCelsius: nullable({ type: 'number' }),
       },
     },
@@ -72,6 +72,7 @@ const STATUS_SCHEMA = {
       additionalProperties: false,
       properties: {
         usagePercent: nullable({ type: 'number' }),
+        name: nullable({ type: 'string' }),
       },
     },
     memory: {
@@ -316,13 +317,14 @@ export function registerPcManagerTools(ctx: Context, config: ToolsConfig): void 
 
   ctx.tools.register(defineTool({
     name: 'pc_junk_scan',
-    description: 'Enumerate reclaimable junk on this host — Trash, user caches, system temp, package-manager '
-      + 'caches (npm/pnpm/pip/uv/yarn/go/Homebrew), and on macOS also user logs, Xcode build artifacts, '
-      + 'simulator leftovers, and iOS device backups — with per-item sizes, safety notes, and suggested '
-      + 'commands for items that must not be deleted directly. Always a dry run: scanning deletes nothing. '
-      + 'After scanning, present a per-category summary to the user and ask which categories or items to '
-      + 'clean — prefer the ask_user_question tool for that choice when it is available — before ever calling '
-      + 'pc_junk_clean.',
+    description: 'Enumerate reclaimable junk on this host — the Trash (Recycle Bin on Windows), user caches, '
+      + 'system temp, and package-manager caches (npm/pnpm/pip/uv/yarn/go/Homebrew); on macOS also user logs, '
+      + 'Xcode build artifacts, simulator leftovers, and iOS device backups; on Windows also Windows Error '
+      + 'Reporting archives, crash dumps, the WinINet cache, and DirectX/NVIDIA shader caches — with per-item '
+      + 'sizes, safety notes, and suggested commands for items that must not be deleted directly. Always a dry '
+      + 'run: scanning deletes nothing. After scanning, present a per-category summary to the user and ask which '
+      + 'categories or items to clean — prefer the ask_user_question tool for that choice when it is available — '
+      + 'before ever calling pc_junk_clean.',
     parameters: {
       kinds: {
         type: 'array',
@@ -352,7 +354,8 @@ export function registerPcManagerTools(ctx: Context, config: ToolsConfig): void 
     name: 'pc_junk_clean',
     description: 'Reclaim the junk items whose exact ids were returned by pc_junk_scan. Only call '
       + 'this after the user has explicitly confirmed the exact selection and the destination '
-      + '(Trash by default, recoverable); restate the items and sizes when asking, prefer '
+      + '(the Trash — the Recycle Bin on Windows — by default, recoverable); restate the items and '
+      + 'sizes when asking, prefer '
       + 'ask_user_question for the confirmation when available. Permanent deletion is only '
       + 'possible when the host config sets moveToTrash to false — say so instead of retrying if '
       + 'the user asks for it. Items from targets marked safeToClean:false are refused with '
@@ -382,8 +385,8 @@ export function registerPcManagerTools(ctx: Context, config: ToolsConfig): void 
   ctx.tools.register(defineTool({
     name: 'pc_apps_list',
     description: 'List installed applications (app bundles and Homebrew formulae/casks on macOS; '
-      + 'distro packages on Linux once M3 lands) with sizes and last-launch times when observable. '
-      + 'Read-only.',
+      + 'distro packages on Linux and registered programs on Windows once M3 lands) with sizes and '
+      + 'last-launch times when observable. Read-only.',
     parameters: {},
     output: { schema: { oneOf: [APPS_LIST_SCHEMA, ERROR_SCHEMA] }, render: renderValue },
     execute: () => guarded(() => listApps()),

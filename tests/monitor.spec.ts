@@ -15,11 +15,17 @@ import {
   parsePs, parsePmsetBatt, parseSsTinp, parseSwapUsage, parseVmStat, pickCpuTempCelsius,
   pickLocalAddresses, sortByNetworkRate, sortProcesses, unionProcessRows,
 } from '../src/monitor.ts'
-import type { DiskstatSample, ProcessRateState } from '../src/monitor.ts'
-import { JUNK_TARGETS, JUNK_TARGETS_DARWIN, JUNK_TARGETS_LINUX, resolveTargets } from '../src/junk.ts'
+import type { ProcessRateState } from '../src/monitor.ts'
+import { JUNK_TARGETS, JUNK_TARGETS_DARWIN, JUNK_TARGETS_LINUX, JUNK_TARGETS_WIN32, resolveTargets } from '../src/junk.ts'
+import type { JunkTarget } from '../src/junk.ts'
 import { platform } from 'node:os'
 import type { CpuInfo } from 'node:os'
 import type { ProcessInfo } from '../src/types.ts'
+
+/** Minimal registry row for the resolution cases. */
+function targetRow(kind: string, dir: string): JunkTarget {
+  return { kind: kind as JunkTarget['kind'], label: kind, dir, safeToClean: true, rationale: kind, granularity: 'whole' }
+}
 
 const DF_SAMPLE = `Filesystem   1024-blocks      Used Available Capacity iused ifree %iused  Mounted on
 /dev/disk3s1s1   983249944 30555144 528358424     6%  477734 2636168062     0%   /
@@ -426,8 +432,31 @@ describe('resolveTargets', () => {
     expect(linux[3].dir).toBe('/var/tmp')
   })
 
+  it('expands %VAR% roots against the injected environment (Windows)', () => {
+    const env = {
+      SystemDrive: 'D:',
+      TEMP: 'D:\\Temp',
+      SystemRoot: 'D:\\Windows',
+      LOCALAPPDATA: 'D:\\Users\\t\\AppData\\Local',
+      USERPROFILE: 'D:\\Users\\t',
+    }
+    const win = resolveTargets(JUNK_TARGETS_WIN32, 'D:\\Users\\t', env)
+    expect(win).toHaveLength(18)
+    expect(win[0].dir).toBe('D:\\$Recycle.Bin')
+    expect(win[1].dir).toBe('D:\\Temp')
+    expect(win[2].dir).toBe('D:\\Windows\\Temp')
+    expect(win.filter(row => row.kind === 'go-mod-cache')[0]?.dir).toBe('D:\\Users\\t\\go\\pkg\\mod\\cache')
+    // An unknown placeholder stays verbatim: the root simply does not exist,
+    // which yields no items rather than a wrong path.
+    const [unknown] = resolveTargets([targetRow('npm-cache', '%NOT_SET_ANYWHERE%\\cache')], 'D:\\Users\\t', env)
+    expect(unknown?.dir).toBe('%NOT_SET_ANYWHERE%\\cache')
+  })
+
   it('dispatches JUNK_TARGETS by the runtime platform', () => {
-    expect(JUNK_TARGETS).toBe(platform() === 'linux' ? JUNK_TARGETS_LINUX : JUNK_TARGETS_DARWIN)
+    const expected = platform() === 'linux' ? JUNK_TARGETS_LINUX
+      : platform() === 'win32' ? JUNK_TARGETS_WIN32
+        : JUNK_TARGETS_DARWIN
+    expect(JUNK_TARGETS).toBe(expected)
   })
 })
 

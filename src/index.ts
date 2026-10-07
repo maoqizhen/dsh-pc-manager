@@ -369,6 +369,10 @@ function serveJunkFaces(ctx: Context, config: Config): void {
 }
 
 export function apply(ctx: Context, config: Config = {}): void {
+  // The pump skips overlapping rounds, so a Windows host (one PowerShell bundle
+  // per round, ~2.5-4.5 s) simply runs at its own cadence whatever the client
+  // asks for — the configured interval stays a floor on Linux/macOS rather than
+  // something the host silently rewrites per platform.
   const pollMs = Math.max(MIN_DASHBOARD_POLL_MS, config.dashboardPollMs ?? DEFAULT_DASHBOARD_POLL_MS)
   const maxTopProcesses = config.maxTopProcesses ?? DEFAULT_TOP_PROCESSES
   const ipGeo = config.enableIpGeoLookup ?? true
