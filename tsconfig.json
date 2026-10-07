@@ -1,0 +1,90 @@
+{
+  "compilerOptions": {
+    "noEmit": true,
+    "strict": true,
+    "target": "ES2024",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "ignoreDeprecations": "6.0",
+    "types": ["node", "react"],
+    "typeRoots": [
+      "../../deepseek-harness/node_modules/@types",
+      "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@types"
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "react": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@types/react"
+      ],
+      "react/*": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@types/react/*"
+      ],
+      "vitest": [
+        "../../deepseek-harness/apps/web/node_modules/vitest"
+      ],
+      "@deepseek-ai/cordis": [
+        "../../deepseek-harness/packages/core/tools/node_modules/@deepseek-ai/cordis"
+      ],
+      "@deepseek-ai/cordis/client": [
+        "../../deepseek-harness/packages/core/tools/node_modules/@deepseek-ai/cordis/client"
+      ],
+      "@deepseek-ai/schemastery": [
+        "../../deepseek-harness/packages/core/tools/node_modules/@deepseek-ai/schemastery"
+      ],
+      "@deepseek-ai/dsh-tools": [
+        "../../deepseek-harness/packages/shell/tool-bash/node_modules/@deepseek-ai/dsh-tools"
+      ],
+      "@deepseek-ai/dsh-host-webserver": [
+        "../../deepseek-harness/packages/client/modules/node_modules/@deepseek-ai/dsh-host-webserver"
+      ],
+      "@deepseek-ai/dsh-client-ui-slots": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "@deepseek-ai/dsh-client-ui-slots/client": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@deepseek-ai/dsh-client-ui-slots/lib/types/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-sidebar-right": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@deepseek-ai/dsh-client-ui-sidebar-right"
+      ],
+      "@deepseek-ai/dsh-client-ui-sidebar-right/client": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@deepseek-ai/dsh-client-ui-sidebar-right/lib/types/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-layout": [
+        "../../deepseek-harness/packages/client/ui-layout"
+      ],
+      "@deepseek-ai/dsh-client-ui-layout/client": [
+        "../../deepseek-harness/packages/client/ui-layout/lib/types/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-primitives": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@deepseek-ai/dsh-client-ui-primitives"
+      ],
+      "@deepseek-ai/dsh-client-ui-primitives/client": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@deepseek-ai/dsh-client-ui-primitives/lib/types/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-locale": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@deepseek-ai/dsh-client-locale"
+      ],
+      "@deepseek-ai/dsh-client-locale/client": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@deepseek-ai/dsh-client-locale/lib/types/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-session": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@deepseek-ai/dsh-client-ui-session"
+      ],
+      "@deepseek-ai/dsh-client-ui-session/client": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@deepseek-ai/dsh-client-ui-session/lib/types/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-renderer": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@deepseek-ai/dsh-client-ui-renderer"
+      ],
+      "@deepseek-ai/dsh-client-ui-renderer/client": [
+        "../../deepseek-harness/packages/client/ui-sidebar-files/node_modules/@deepseek-ai/dsh-client-ui-renderer/lib/types/client/index.d.ts"
+      ]
+    }
+  },
+  "include": ["src", "tests", "tsdown.config.ts"]
+}

@@ -1,0 +1,31 @@
+# PC Manager (电脑管家) overlay: mounts five model-facing system tools —
+# pc_status / pc_junk_scan / pc_junk_clean / pc_apps_list / pc_app_uninstall —
+# plus the right-sidebar system dashboard (client half of the same package).
+# Purely additive: no built-in plugin is disabled. Both destructive tools stay
+# disabled until their switches below turn true, and default to the Trash.
+#
+# One-time dev setup (the row resolves the package by name, like in-repo
+# client plugins; the client-modules browser scan only resolves named rows).
+# Run from this repository's root; assumes deepseek-harness is checked out
+# side by side — substitute your actual paths otherwise:
+#   ln -sfn "$PWD" ../deepseek-harness/node_modules/@deepseek-ai/dsh-pc-manager
+#
+# The dashboard client bundle must be built first (lib/client.js):
+#   cd ../deepseek-harness && node_modules/.bin/tsdown --config ../dsh-pc-manager/tsdown.config.ts
+#
+# Run from the deepseek-harness repository root (this plugin lives outside it):
+#   pnpm dsh --patch ../dsh-pc-manager/cordis.patch.yml --profile web
+- insert:
+    - id: pc-manager
+      name: '@deepseek-ai/dsh-pc-manager'
+      config:
+        enableJunkClean: true       # pc_junk_clean is live: every call still passes the
+        #                            # host-side approval prompt (askBeforeJunkClean, default true)
+        enableAppUninstall: false   # pc_app_uninstall refuses with disabled_by_config until true
+        moveToTrash: true           # reclaimed bytes go to the Trash (recoverable)
+        # askBeforeJunkClean (default true, omit the key): every pc_junk_clean
+        # call must pass the host-side approval prompt. Headless CLI profiles
+        # have no approval answerer and fail closed; skipping the gate there
+        # requires writing askBeforeJunkClean: false by hand.
+        maxTopProcesses: 10
+        dashboardPollMs: 2000       # dashboard refresh interval, min 500
