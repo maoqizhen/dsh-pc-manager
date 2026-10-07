@@ -24,7 +24,13 @@ dsh plugin --profile web add "github:maoqizhen/dsh-pc-manager#main"
 卸载 `dsh plugin --profile web remove dsh-pc-manager`，均需重启生效。
 
 > **需要 pnpm**：`dsh plugin` 是 pnpm 转发器，PATH 里没有 pnpm 会直接失败
-> （`npm i -g pnpm` 安装；pnpm 主版本需与 profile 现有 store 一致）。
+> （`npm i -g pnpm` 安装；pnpm 主版本需与 profile 现有 store 一致）。服务器上若以非登录
+> shell 跑 dsh，确认 `node`/`pnpm` 对该进程的 PATH 可见（如放进 `/usr/local/bin`）。
+
+**link 安装（开发）的生效时机**：`install_bundle` 指向本地目录时以 `link:` 挂载——host 半在
+安装/启停行时即时生效；浏览器半在**页面刷新**时取新 `lib/client.js`；但对**已在运行**的 dsh
+进程改 host 代码后，Node 的 ESM 模块缓存不会因重载插件行而释放，host 半的新代码要等**下次
+`dsh web` 重启**。因此 client 对新帧字段一律做 `typeof` 容错（如温度行），重启窗口期不会崩。
 
 安装即安全默认：只读工具开箱即用，两个破坏性工具（`pc_junk_clean` / `pc_app_uninstall`）
 拒绝执行（`disabled_by_config`）。要启用垃圾清理，在**后层 patch**（profile 的
@@ -62,7 +68,7 @@ ln -s "$PWD" ~/.dsh/profiles/web/node_modules/dsh-pc-manager
 
 | 工具 | 功能 | 状态 |
 | --- | --- | --- |
-| `pc_status` | 只读系统快照：CPU/GPU 使用率、负载、内存分解（含 swap）、磁盘 I/O 与各卷占用、电池/电源、网络计数器、多键排序进程表（macOS + Linux） | ✅ 已实装 |
+| `pc_status` | 只读系统快照：CPU/GPU 使用率、负载、温度（能力门控）、内存分解（含 swap）、磁盘 I/O 与各卷占用、电池/电源、网络计数器、多键排序进程表（macOS + Linux；进程级网络/GPU 同为能力门控） | ✅ 已实装 |
 | `pc_junk_scan` | 枚举可回收垃圾（macOS：废纸篓、用户缓存/日志、系统临时、Xcode 产物、模拟器残留、包管理器缓存、iOS 备份；Linux：XDG 回收站、~/.cache、/tmp 与 /var/tmp、包管理器缓存），逐项体积/安全标记/保护排除记录；参数 `kinds` / `minItemBytes`；永远 dry-run | ✅ 已实装 |
 | `pc_junk_clean` | 按 scan 返回的精确 id 回收；结构校验链（格式/根包含/realpath/blocked/safeToClean）任一失败整体拒绝零删除；`trash` kind 原地清空、其余默认三级 trash（macOS：`/usr/bin/trash` → rename `~/.Trash` → 跨卷 cp+rm；Linux：`trash-put`/`gio trash` → freedesktop `~/.local/share/Trash/{files,info}` 带 `.trashinfo` 还原记录 → 跨卷 cp+rm）；量不准不删；需配置显式开启 | ✅ 已实装 |
 | `pc_apps_list` | 已装应用清单（app bundle + Homebrew），含大小/最近使用 | 桩，M3 |
@@ -127,10 +133,15 @@ flatpak 状态）、`/var/cache`、`/lib*`（含运行中内核模块）、`/srv
 ## 仪表盘（右侧边栏）
 
 web profile 的右侧边栏"系统监控"入口（order 30），点开是窄列卡片仪表盘：
-头部（主机/系统/运行时长）→ CPU（条+负载+sparkline）→ GPU（取不到整卡隐藏）→ 内存（swap+分解）→
-磁盘（有效卷用量条 + I/O 速率）→ 电池（无电池隐藏）→ 网络（主接口速率+sparkline）→
-进程表（按 CPU/内存/网络切换，默认前 10）。手写 SVG，无图表库。
+头部（主机/系统/运行时长）→ CPU（条+负载+温度行*+sparkline）→ GPU（取不到整卡隐藏）→
+内存（swap+分解）→ 磁盘（有效卷用量条 + I/O 速率）→ 电池（无电池隐藏）→ 网络（主接口
+速率+sparkline）→ 进程表（按 CPU/内存/网络切换，默认前 10；CPU 列表头悬停显示口径说明）。
+手写 SVG，无图表库。
 
+- **能力门控行/列**：CPU 卡温度行（Linux 有传感器才出现）、进程表"网络"列（macOS nettop 恒有；
+  Linux root `ss -tinp` 归因才出现）、"GPU"列（Linux 有 NVIDIA 硬件才出现）——缺能力即隐藏、
+  不摆"—"墙，详见[能力门控探针](#能力门控探针)。进程 CPU% 为**单核口径**（多核进程可超
+  100%）且为 ps 生命周期平均，表头 tooltip 有说明。
 - 数据走同进程 host 半的**单一采集泵 + SSE 推送**：`GET /pc-manager/stream`（text/event-stream）
   是共享基座——host 侧一个定时器（间隔 `dashboardPollMs`，可调 min 500）单路采集并做服务端
   差分（网络速率首帧即有），仪表盘与悬浮窗等所有消费者共享同一条连接、同一帧数据；**无消费者
@@ -138,6 +149,28 @@ web profile 的右侧边栏"系统监控"入口（order 30），点开是窄列�
   （`?processSort=&processLimit=`）保留为缓存兜底：与泵同排序（默认 CPU）的请求直接读新鲜
   缓存，其他排序现场采集。LLM 工具 `pc_status` 不经泵、契约不变。
 - headless profile（无 webServer）自动跳过路由注册，工具不受影响。
+
+### 反向代理 / 前缀挂载部署
+
+浏览器侧全部请求（SSE 与 JSON）走**文档相对路径**（`pc-manager/…`，无前导 `/`），由 web shell
+的 `<base href="./">` 解析——这是 harness 的既有约定（架构笔记 *web-document-relative-app-routes*，
+与 `/plugins/events` 通道同规）。因此本插件**天然支持前缀剥除型反代挂载**（如
+`https://host/dsh/` → 转发并剥前缀），也兼容源站根路径部署，无需二次构建。
+
+SSE 流经反代时建议与 dsh 自身的 `/plugins/events` 同款配置，否则默认缓冲会延迟推帧、60s 默认
+读超时会掐断长连接：
+
+```nginx
+location = /dsh/pc-manager/stream {
+    proxy_pass http://127.0.0.1:3080/pc-manager/stream;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 24h;
+    proxy_send_timeout 24h;
+}
+```
 
 ## 垃圾清理（零 LLM 直执行窗口）
 
@@ -226,14 +259,17 @@ npm test                         # vitest（122 specs，root 环境自动跳过 
 ```
 
 覆盖全部纯解析器（df 双平台含 Linux 伪文件系统过滤/ps/vm_stat/meminfo/swapusage/os-release/
-pmset/ioreg 电池与 GPU/nvidia-smi/iostat/diskstats 速率差分/netstat/net-dev/nettop CSV+JSON/
-power_supply uevent/进程合并排序/CPU 差分）与垃圾域全套（双平台注册表与保护清单逐条 pin、
-glob 展开、走查统计、scan 语义、校验链逐层含符号链接重定向、整体拒绝、双平台 trash 三级
-（含 .trashinfo 还原记录与冲突后缀同步）、blocked 红线并集、量不准不删、审批摘要 en/zh 快照）。
-权限降级（EACCES）用例需非 root 运行器，root 下自动跳过（root 的 DAC override 读穿 0000 权限）。
+pmset/ioreg 电池与 GPU/nvidia-smi 整卡+pmon 进程级/iostat/diskstats 速率差分/netstat/net-dev/
+nettop CSV+JSON/ss -tinp 归因/power_supply uevent/温度芯片选路/进程与 GPU 合并排序/CPU 差分）
+与垃圾域全套（双平台注册表与保护清单逐条 pin、glob 展开、走查统计、scan 语义、校验链逐层含
+符号链接重定向、整体拒绝、双平台 trash 三级（含 .trashinfo 还原记录与冲突后缀同步）、blocked
+红线并集、量不准不删、审批摘要 en/zh 快照）。权限降级（EACCES）用例需非 root 运行器，root 下
+自动跳过（root 的 DAC override 读穿 0000 权限）。
 
 **发布约定**：改完源码必须 `npm run build` 并把 `lib/*.js` 一并提交——git 安装直接加载已提交
-产物，不跑任何构建脚本（这也是免掉 pnpm ≥10 构建授权的方式）。
+产物，不跑任何构建脚本（这也是免掉 pnpm ≥10 构建授权的方式）。构建工具链注意：`scripts/build.mjs`
+以 `tsdown --config-loader native` 加载 TS 配置并自动加 `--experimental-strip-types`（tsdown 默认
+的 unrun 配置加载器不是 harness 依赖，Node <23 也需要该 flag），无需手工干预。
 
 ## 里程碑
 
