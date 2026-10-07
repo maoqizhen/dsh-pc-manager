@@ -2,11 +2,58 @@
 
 > DSH plugin for system monitor and junk cleanup · 系统监控、垃圾清理与应用卸载的 DeepSeek Harness 插件
 
-DeepSeek Harness (dsh) 的电脑管家插件，住在 harness 仓库外部，通过 cordis patch 挂载：
-系统状态监控（模型工具 + 右侧边栏仪表盘）、系统垃圾清理、软件卸载，暴露 5 个模型可见工具。
+DeepSeek Harness (dsh) 的电脑管家插件（官方 bundle 格式），提供：系统状态监控（模型工具 +
+右侧边栏仪表盘）、系统垃圾清理（零 LLM 直执行窗口）、软件卸载（M3），共 5 个模型可见工具。
 
 定位是**安全第一**的 agent 系统工具：扫描永远 dry-run；破坏性工具默认 `disabled_by_config`，
 宿主显式开启才动手；回收/卸载默认进废纸篓（可恢复）；id 校验链任一失败**整体拒绝零删除**。
+
+## 安装（一行）
+
+本仓库是官方 **bundle 插件**格式（根 `package.json` 的 `dsh.bundle` + `dsh.client`），
+构建产物 `lib/` 已提交，git 安装无需任何构建步骤：
+
+```sh
+dsh plugin --profile web add "github:maoqizhen/dsh-pc-manager#main"
+```
+
+装完**重启 `dsh web`**（bundle 层在启动时合成）。更新 `dsh plugin --profile web update dsh-pc-manager`，
+卸载 `dsh plugin --profile web remove dsh-pc-manager`，均需重启生效。
+
+> **需要 pnpm**：`dsh plugin` 是 pnpm 转发器，PATH 里没有 pnpm 会直接失败
+> （`npm i -g pnpm` 安装；pnpm 主版本需与 profile 现有 store 一致）。
+
+安装即安全默认：只读工具开箱即用，两个破坏性工具（`pc_junk_clean` / `pc_app_uninstall`）
+拒绝执行（`disabled_by_config`）。要启用垃圾清理，在**后层 patch**（profile 的
+`cordis.patch.yml` 或 `~/.dsh/cordis.patch.yml`，后层整行替换 config，需重述全部键）写入：
+
+```yaml
+- insert:
+    - id: pc-manager
+      name: dsh-pc-manager
+      config:
+        enableJunkClean: true     # 仍需通过每次调用的宿主审批闸门
+        moveToTrash: true         # 默认进废纸篓（可恢复）
+```
+
+### 手动挂载（兜底，与 bundle 安装二选一）
+
+无需 `dsh plugin add`，但必须**双 entry**（包名挂载让 client 半被 `clientModules` 扫描发现，
+文件路径挂载让 host 半的 `apply` 执行；官方 bundle 安装无此问题）：
+
+```bash
+# 1. 让 profile 能按包名解析（client 半的发现机制走 require.resolve('<pkg>/package.json')）
+ln -s "$PWD" ~/.dsh/profiles/web/node_modules/dsh-pc-manager
+
+# 2. 在 ~/.dsh/cordis.patch.yml 追加双 entry（host 走绝对路径，client 走包名）
+# - insert:
+#     - id: pc-manager
+#       name: /abs/path/to/dsh-pc-manager/lib/index.js
+#     - id: pc-manager-client
+#       name: dsh-pc-manager
+
+# 3. 重启 dsh web
+```
 
 ## 工具一览
 
@@ -70,8 +117,8 @@ danger-full-access（`approval: never`）时会话内 ask 被静默自动拒绝�
 
 ## 安全设计
 
-- **只读工具开箱即用**；两个破坏性工具（`pc_junk_clean`、`pc_app_uninstall`）默认
-  `disabled_by_config`，宿主在 patch 里把开关置 true 才会真正动手。
+- **只读工具开箱即用**；两个破坏性工具默认 `disabled_by_config`，宿主在后层 patch 把开关置
+  true 才会真正动手。
 - 回收/卸载默认走**废纸篓**（可恢复）；永久删除需 `moveToTrash: false`。trash 落地三级：
   `/usr/bin/trash`（绝对路径调用，防 PATH 劫持）→ 归属校验后的 `~/.Trash` rename（名冲突加
   ` 2`/` 3` 后缀）→ 跨卷 EXDEV 时 cp+rm；`trash` kind 本身原地清空（搬回废纸篓是无意义的套娃）。
@@ -87,8 +134,9 @@ danger-full-access（`approval: never`）时会话内 ask 被静默自动拒绝�
 
 ## 仓库结构
 
-本仓库根即插件包根（`@deepseek-ai/dsh-pc-manager`，dual-face：host 半吃 TS 源码，
-浏览器半吃构建产物 `lib/client.js`）：
+dual-face 包：host 半（工具 + 路由）与浏览器半都吃**已提交的构建产物 `lib/`**
+（host `index.js` ESM，外部依赖经 dsh 运行时解析；client `client.js` 是
+`window.__ModuleLoader__.load` 工件）：
 
 ```
 ├── src/
@@ -99,55 +147,47 @@ danger-full-access（`approval: never`）时会话内 ask 被静默自动拒绝�
 │   ├── types.ts       领域契约、PcManagerError、封闭错误词表 PcErrorCode
 │   ├── tools.ts       唯一接触 defineTool 的注册层：guarded() 异常→封闭错误联合
 │   └── client/        浏览器半：仪表盘 / 垃圾清理窗口 / 悬浮窗 / locale（值导入仅 react 系）
+├── lib/               构建产物（已提交：host index.js + client client.js；*.map 忽略）
 ├── tests/             vitest：全部解析器 + 垃圾域全套（注册表逐条 pin、校验链逐层）
-├── cordis.patch.yml   宿主挂载清单（purely additive，不覆盖内置插件）
-├── tsdown.config.ts   client bundle 自包含构建（CJS + window.__ModuleLoader__ 工件契约）
-├── tsconfig.json      类型检查专用（paths 把依赖映射到 harness 包节点）
-└── package.json
+├── scripts/           build / test / dev-setup（一键：链接 profile + 构建）
+├── bundle.patch.yml   bundle 层（dsh.plugin add 时应用；安全默认，破坏性工具关闭）
+├── cordis.patch.yml   开发 overlay（--patch 挂载，含本地 dogfooding 的开关配置）
+├── tsdown.config.ts   双 entry 构建（host ESM + client CJS 工件契约）
+├── tsconfig.json      类型检查专用（paths 双候选映射到并列/嵌套两种 harness 布局）
+└── package.json       dsh-pc-manager（dsh.bundle + dsh.client + 真实 semver peer 范围）
 ```
 
 ## 本地开发
 
-前置：本仓库与 deepseek-harness **并列检出**（本仓库在 `../dsh-pc-manager`、harness 在
-`../deepseek-harness`，路径不同请自行替换）。依赖与工具链（tsdown / vitest / tsc）全部借
-harness 侧解析，本仓库**不要 `pnpm install`**。
+前置：本仓库与 [deepseek-harness](../deepseek-harness) **并列检出**（或嵌套在上一层的工作区
+目录里，或用 `DSH_HARNESS_ROOT` 环境变量指认）。工具链（tsdown / vitest / tsc）全部借 harness
+侧解析，本仓库**不要 `pnpm install`**，也没有任何 `node_modules`。
 
-一次性装载通道（外部 client 插件经 profile 的 node_modules 符号链接解析，loader 的
-linkedRoots 与 client-modules 扫描都以此为准），在**本仓库根**执行：
+一键 dev 安装（链接进 profile 的 node_modules + 构建产物，幂等）：
 
-```bash
-mkdir -p ~/.dsh/profiles/web/node_modules/@deepseek-ai
-ln -sfn "$PWD" ~/.dsh/profiles/web/node_modules/@deepseek-ai/dsh-pc-manager
+```sh
+npm run dev-setup                # 默认 --profile web；或 node scripts/dev-setup.mjs --profile <name>
 ```
 
-构建仪表盘 client bundle（借 harness 的 tsdown，产出 `lib/client.js`）：
+运行（在 harness 仓库根执行；host 半现在也吃 `lib/index.js`，改完 host 代码需重新 `npm run build`）：
 
-```bash
+```sh
 cd ../deepseek-harness
-node_modules/.bin/tsdown --config ../dsh-pc-manager/tsdown.config.ts
-```
-
-运行（在 harness 仓库根执行）：
-
-```bash
 pnpm dsh --patch ../dsh-pc-manager/cordis.patch.yml --profile web
 ```
 
-host 半（工具 + 路由）由 loader 直接吃 TS 源码；只有 client bundle 需要先构建。
+测试与类型检查：
 
-### 测试与类型检查
-
-harness 的 vitest 配置只收 `packages/` 内的 spec，外部项目用它的 vitest 二进制以本仓库为 root 运行：
-
-```bash
-cd ../deepseek-harness
-node_modules/.bin/vitest run --root ../dsh-pc-manager
-node_modules/.bin/tsc --noEmit -p ../dsh-pc-manager/tsconfig.json   # 类型检查(tsdown 不查类型)
+```sh
+npm test                         # vitest（81 specs）+ tsc --noEmit，均借 harness 二进制
 ```
 
 覆盖全部纯解析器（df/ps/vm_stat/swapusage/pmset/ioreg 电池与 GPU/iostat/netstat/nettop CSV+JSON/
 进程合并排序/CPU 差分）与垃圾域全套（注册表与保护清单逐条 pin、glob 展开、走查统计、scan 语义、
 校验链逐层含符号链接重定向、整体拒绝、trash 三级、量不准不删、审批摘要 en/zh 快照）。
+
+**发布约定**：改完源码必须 `npm run build` 并把 `lib/*.js` 一并提交——git 安装直接加载已提交
+产物，不跑任何构建脚本（这也是免掉 pnpm ≥10 构建授权的方式）。
 
 ## 里程碑
 

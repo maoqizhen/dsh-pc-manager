@@ -1,0 +1,16 @@
+# dsh-pc-manager bundle layer: mounts the plugin with safe defaults.
+# Applied automatically when a profile lists this bundle (dsh.bundle in
+# package.json points here). Both destructive tools stay disabled_by_config;
+# opt in from a later layer (the profile's cordis.patch.yml or
+# ~/.dsh/cordis.patch.yml), restating every key — a later layer replaces the
+# row's config wholesale:
+#
+#   - insert:
+#       - id: pc-manager
+#         name: dsh-pc-manager
+#         config:
+#           enableJunkClean: true
+#           moveToTrash: true
+- insert:
+    - id: pc-manager
+      name: dsh-pc-manager

@@ -1,17 +1,57 @@
 {
-  "name": "@deepseek-ai/dsh-pc-manager",
-  "description": "PC Manager (电脑管家) — system status monitoring (model tools + right-sidebar dashboard), junk cleanup, and app uninstall for DeepSeek Harness",
+  "name": "dsh-pc-manager",
   "version": "0.0.1",
-  "private": true,
+  "description": "PC Manager (电脑管家) — system status monitoring (model tools + right-sidebar dashboard), junk cleanup, and app uninstall for DeepSeek Harness",
   "type": "module",
-  "main": "src/index.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/maoqizhen/dsh-pc-manager.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "system-monitor",
+    "junk-cleanup",
+    "macos"
+  ],
+  "engines": {
+    "dsh": ">=0.2.0-rc.1",
+    "node": ">=22.19"
+  },
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/test.mjs",
+    "dev-setup": "node scripts/dev-setup.mjs"
+  },
   "exports": {
-    ".": "./src/index.ts",
+    ".": "./lib/index.js",
     "./client": "./lib/client.js",
-    "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
+  "files": [
+    "lib",
+    "bundle.patch.yml",
+    "cordis.patch.yml",
+    "scripts"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.3",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.1 || ^0.2.1-alpha.1"
+  },
   "dsh": {
+    "compatibility": {
+      "dshReleases": {
+        "0.2.0-rc.1": "compatible",
+        "0.2.0-rc.2": "compatible"
+      }
+    },
+    "bundle": {
+      "patch": "./bundle.patch.yml"
+    },
     "client": {
       "platform": "web",
       "inject": [
@@ -20,24 +60,5 @@
         "@deepseek-ai/dsh-client-ui-layout"
       ]
     }
-  },
-  "license": "MIT",
-  "peerDependencies": {
-    "@deepseek-ai/cordis": "workspace:^",
-    "@deepseek-ai/dsh-tools": "workspace:^"
-  },
-  "dependencies": {
-    "@deepseek-ai/schemastery": "workspace:^"
-  },
-  "devDependencies": {
-    "@deepseek-ai/cordis": "workspace:^",
-    "@deepseek-ai/dsh-client-locale": "workspace:*",
-    "@deepseek-ai/dsh-client-ui-primitives": "workspace:*",
-    "@deepseek-ai/dsh-client-ui-session": "workspace:*",
-    "@deepseek-ai/dsh-client-ui-sidebar-right": "workspace:*",
-    "@deepseek-ai/dsh-client-ui-slots": "workspace:*",
-    "@deepseek-ai/dsh-host-webserver": "workspace:^",
-    "@deepseek-ai/dsh-tools": "workspace:^",
-    "@deepseek-ai/dsh-client-ui-layout": "workspace:*"
   }
 }

@@ -1,23 +1,22 @@
-# PC Manager (电脑管家) overlay: mounts five model-facing system tools —
+# PC Manager (电脑管家) dev overlay — mounts five model-facing system tools —
 # pc_status / pc_junk_scan / pc_junk_clean / pc_apps_list / pc_app_uninstall —
 # plus the right-sidebar system dashboard (client half of the same package).
-# Purely additive: no built-in plugin is disabled. Both destructive tools stay
-# disabled until their switches below turn true, and default to the Trash.
 #
-# One-time dev setup (the row resolves the package by name, like in-repo
-# client plugins; the client-modules browser scan only resolves named rows).
-# Run from this repository's root; assumes deepseek-harness is checked out
-# side by side — substitute your actual paths otherwise:
-#   ln -sfn "$PWD" ../deepseek-harness/node_modules/@deepseek-ai/dsh-pc-manager
+# Two patches, two roles (see README):
+#   - bundle.patch.yml — what `dsh plugin add` installs apply; safe defaults,
+#     both destructive tools off. This package's dsh.bundle points there.
+#   - cordis.patch.yml (this file) — the developer's own --patch overlay with
+#     the destructive gates turned on for local dogfooding.
 #
-# The dashboard client bundle must be built first (lib/client.js):
-#   cd ../deepseek-harness && node_modules/.bin/tsdown --config ../dsh-pc-manager/tsdown.config.ts
+# One-time dev setup (links this package into the profile's node_modules by
+# package name and builds lib/):
+#   npm run dev-setup            # or: node scripts/dev-setup.mjs --profile web
 #
 # Run from the deepseek-harness repository root (this plugin lives outside it):
 #   pnpm dsh --patch ../dsh-pc-manager/cordis.patch.yml --profile web
 - insert:
     - id: pc-manager
-      name: '@deepseek-ai/dsh-pc-manager'
+      name: dsh-pc-manager
       config:
         enableJunkClean: true       # pc_junk_clean is live: every call still passes the
         #                            # host-side approval prompt (askBeforeJunkClean, default true)
