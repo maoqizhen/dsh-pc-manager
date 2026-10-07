@@ -60,6 +60,7 @@ const STATUS_SCHEMA = {
         cores: { type: 'number', required: true },
         usagePercent: nullable({ type: 'number' }),
         loadavg: { type: 'array', required: true, items: { type: 'number' } },
+        temperatureCelsius: nullable({ type: 'number' }),
       },
     },
     gpu: {
@@ -280,10 +281,11 @@ async function guarded<T>(task: () => Promise<T>): Promise<T | PcErrorValue> {
 export function registerPcManagerTools(ctx: Context, config: ToolsConfig): void {
   ctx.tools.register(defineTool({
     name: 'pc_status',
-    description: 'Read one system status snapshot: CPU model/cores/utilization/load average, GPU '
-      + 'utilization (best-effort), memory pressure breakdown with swap, disk I/O throughput and '
-      + 'per-volume usage, battery/power, per-interface network counters, and ranked processes '
-      + '(CPU, memory, or network). Read-only; safe to call any time.',
+    description: 'Read one system status snapshot: CPU model/cores/utilization/load average '
+      + '(and package temperature when the host exposes a sensor), GPU utilization (best-effort), '
+      + 'memory pressure breakdown with swap, disk I/O throughput and per-volume usage, battery/power, '
+      + 'per-interface network counters, and ranked processes (CPU, memory, or network). Read-only; '
+      + 'safe to call any time.',
     parameters: {},
     output: { schema: { oneOf: [STATUS_SCHEMA, ERROR_SCHEMA] }, render: renderValue },
     execute: () => guarded(() => collectStatus(config.maxTopProcesses)),

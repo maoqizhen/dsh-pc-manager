@@ -167,6 +167,11 @@ function CpuCard({ status, history, t }: {
           fifteen: formatLoad(status.cpu.loadavg[2]),
         })}</span>
         <span className='pc-manager-muted'>{t('cpu.cores', { cores: status.cpu.cores })}</span>
+        {status.cpu.temperatureCelsius !== null && (
+          <span className='pc-manager-muted'>
+            {t('cpu.temp', { temp: `${status.cpu.temperatureCelsius.toFixed(1)}°C` })}
+          </span>
+        )}
       </div>
     </section>
   )

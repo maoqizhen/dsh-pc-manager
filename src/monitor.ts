@@ -9,7 +9,7 @@
 
 import { execFile } from 'node:child_process'
 import type { Dirent } from 'node:fs'
-import { readFile, readdir } from 'node:fs/promises'
+import { access, constants as fsConstants, readFile, readdir } from 'node:fs/promises'
 import { hostname, loadavg, cpus, freemem, platform, totalmem, uptime } from 'node:os'
 import type { CpuInfo } from 'node:os'
 import { join } from 'node:path'
@@ -469,6 +469,120 @@ export function parseNvidiaSmiGpu(stdout: string): number | null {
 }
 
 /**
+ * Parse `nvidia-smi pmon -c 1` (`gpu pid type sm mem enc dec command` rows,
+ * `#` comment headers, `-` placeholders) into per-pid SM utilization; the
+ * busiest GPU wins when a pid spans several.
+ */
+export function parseNvidiaSmiPmon(stdout: string): Map<number, number> {
+  const rows = new Map<number, number>()
+  for (const line of stdout.split('\n')) {
+    const trimmedLine = line.trim()
+    if (trimmedLine.startsWith('#')) continue
+    const fields = trimmedLine.split(/\s+/)
+    if (fields.length < 5) continue
+    const pid = Number(fields[1])
+    if (!Number.isInteger(pid) || pid <= 0) continue
+    const sm = Number(fields[3])
+    if (!Number.isFinite(sm)) continue
+    const best = rows.get(pid)
+    if (best === undefined || sm > best) rows.set(pid, Math.min(100, sm))
+  }
+  return rows
+}
+
+/** Cached nvidia-smi existence: probing must not spawn (and warn) every
+ * round on hosts without NVIDIA hardware. */
+let nvidiaSmiAvailable: boolean | null = null
+async function hasNvidiaSmi(): Promise<boolean> {
+  if (nvidiaSmiAvailable === null) {
+    nvidiaSmiAvailable = false
+    for (const bin of ['/usr/bin/nvidia-smi', '/usr/local/bin/nvidia-smi']) {
+      if (await access(bin, fsConstants.X_OK).then(() => true, () => false)) {
+        nvidiaSmiAvailable = true
+        break
+      }
+    }
+  }
+  return nvidiaSmiAvailable
+}
+
+/** Attach per-process SM utilization (nvidia-smi pmon) to ps rows by pid. */
+export function mergeGpuPercent(
+  psRows: readonly ProcessInfo[],
+  gpuRows: ReadonlyMap<number, number>,
+): ProcessInfo[] {
+  if (gpuRows.size === 0) return [...psRows]
+  return psRows.map(row => {
+    const gpu = gpuRows.get(row.pid)
+    return gpu === undefined ? row : { ...row, gpuPercent: gpu }
+  })
+}
+
+/** Chip names (hwmon `name` or thermal-zone `type`) whose reading counts as
+ * the CPU package temperature. */
+const CPU_TEMP_SOURCES = /^(?:coretemp|k\d+temp|zenpower|cpu|soc_thermal|soc_dts|acpitz|x86_pkg_temp)/i
+
+/** True when a chip reading may headline as the CPU temperature. */
+export function isCpuTempSource(name: string): boolean {
+  return CPU_TEMP_SOURCES.test(name)
+}
+
+/**
+ * The headline CPU temperature across candidate chips: per-core inputs
+ * report per-core readings, so the max over the CPU-named chips is the
+ * honest glance value. Null when no candidate chip contributed.
+ */
+export function pickCpuTempCelsius(chips: ReadonlyArray<{ name: string, celsius: readonly number[] }>): number | null {
+  let best: number | null = null
+  for (const chip of chips) {
+    if (!isCpuTempSource(chip.name)) continue
+    for (const celsius of chip.celsius) {
+      if (Number.isFinite(celsius) && (best === null || celsius > best)) best = celsius
+    }
+  }
+  return best === null ? null : round1(best)
+}
+
+/**
+ * Linux CPU temperature: hwmon chips (`name` + `temp*_input`, millidegrees)
+ * with a thermal_zone fallback (`type` + `temp`). Zero privileges needed —
+ * but cloud VMs commonly expose no sensor at all, which reads as null.
+ */
+async function readLinuxCpuTemp(): Promise<number | null> {
+  const chips: Array<{ name: string, celsius: number[] }> = []
+  for (const base of ['/sys/class/hwmon', '/sys/class/thermal']) {
+    let entries: Dirent[]
+    try {
+      entries = await readdir(base, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      const chip: { name: string, celsius: number[] } = { name: '', celsius: [] }
+      if (base.endsWith('hwmon')) {
+        if (!entry.name.startsWith('hwmon')) continue
+        const dir = join(base, entry.name)
+        chip.name = (await readFile(join(dir, 'name'), 'utf8').catch(() => '')).trim()
+        for (const file of await readdir(dir).catch(() => [])) {
+          if (/^temp\d+_input$/.test(file)) {
+            const milli = Number((await readFile(join(dir, file), 'utf8').catch(() => '')).trim())
+            if (Number.isFinite(milli)) chip.celsius.push(milli / 1000)
+          }
+        }
+      } else {
+        if (!entry.name.startsWith('thermal_zone')) continue
+        const dir = join(base, entry.name)
+        chip.name = (await readFile(join(dir, 'type'), 'utf8').catch(() => '')).trim()
+        const milli = Number((await readFile(join(dir, 'temp'), 'utf8').catch(() => '')).trim())
+        if (Number.isFinite(milli)) chip.celsius.push(milli / 1000)
+      }
+      chips.push(chip)
+    }
+  }
+  return pickCpuTempCelsius(chips)
+}
+
+/**
  * Parse `iostat -d -c 2` and return the last (instantaneous) sample's total
  * throughput summed across disks, in bytes/sec. Each disk contributes a
  * `KB/t tps MB/s` triple; MB/s is treated as a binary multiple (1024²).
@@ -624,6 +738,56 @@ export function parseNettop(stdout: string): Map<number, ProcessNetCounters> {
   return rows
 }
 
+/**
+ * True when this process may attribute EVERY socket to its pid — `ss -p`
+ * under a normal user only names its own sockets, which would read as
+ * "nobody else uses the network". Root only; injected for tests.
+ */
+export function canAttributeSockets(uid: number | undefined = process.getuid?.()): boolean {
+  return uid === 0
+}
+
+/**
+ * Parse `ss -tinp`, the privileged Linux counterpart of nettop: each socket
+ * row names its owning processes (`users:(("name",pid=1,fd=3))`) and the
+ * indented info line that follows carries cumulative per-socket counters.
+ * Bytes are summed per pid across sockets; tx prefers `bytes_sent` and falls
+ * back to `bytes_acked` (older iproute2). TCP only — the counters live on
+ * tcp_info. A socket shared by several pids credits each of them.
+ */
+export function parseSsTinp(stdout: string): Map<number, ProcessNetCounters> {
+  const rows = new Map<number, ProcessNetCounters>()
+  let pendingPids: number[] | null = null
+  for (const line of stdout.split('\n')) {
+    if (line.startsWith(' ') || line.startsWith('\t')) {
+      // Info continuation of the preceding socket row.
+      if (pendingPids === null) continue
+      const rxRaw = /bytes_received:(\d+)/.exec(line)?.[1]
+      const txRaw = /bytes_sent:(\d+)/.exec(line)?.[1] ?? /bytes_acked:(\d+)/.exec(line)?.[1]
+      if (rxRaw !== undefined || txRaw !== undefined) {
+        for (const pid of pendingPids) {
+          const row = rows.get(pid) ?? { rxBytes: 0, txBytes: 0 }
+          row.rxBytes += rxRaw === undefined ? 0 : Number(rxRaw)
+          row.txBytes += txRaw === undefined ? 0 : Number(txRaw)
+          rows.set(pid, row)
+        }
+      }
+      pendingPids = null
+      continue
+    }
+    const users = /users:\(\((.*)\)\)/.exec(line)?.[1]
+    if (users === undefined) {
+      pendingPids = null
+      continue
+    }
+    pendingPids = [...users.matchAll(/pid=(\d+)/g)]
+      .map(match => Number(match[1]))
+      .filter(pid => Number.isInteger(pid) && pid > 0)
+    if (pendingPids.length === 0) pendingPids = null
+  }
+  return rows
+}
+
 /** Attach per-process network counters to ps rows by pid. */
 export function mergeProcesses(
   psRows: readonly ProcessInfo[],
@@ -758,26 +922,41 @@ function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-/** One probe round of the full process table: ps rows merged with nettop
- * counters (nettop is macOS-only; Linux has no unprivileged per-process
- * byte counters, so its rows carry null network fields). */
+/** One probe round of the full process table: ps rows merged with the
+ * platform's per-process extras — macOS nettop (network); Linux the
+ * privileged `ss -tinp` attribution (network, root-gated) and nvidia-smi
+ * pmon (GPU SM, presence-gated). Capabilities absent → rows carry nulls and
+ * the UI hides the column. */
 export async function mergeProcessTable(): Promise<ProcessInfo[]> {
+  const plat = platform()
   // Linux `comm` truncates to 15 chars; `args` gives the full command line.
-  const psColumns = platform() === 'linux' ? 'pid,pcpu,pmem,rss,args' : 'pid,pcpu,pmem,rss,comm'
-  const onDarwin = platform() === 'darwin'
-  const [psRows, netRows] = await Promise.all([
+  const psColumns = plat === 'linux' ? 'pid,pcpu,pmem,rss,args' : 'pid,pcpu,pmem,rss,comm'
+  const onLinux = plat === 'linux'
+  const [psRows, netRows, gpuRows] = await Promise.all([
     probe('ps', [] as ProcessInfo[], async () => {
       const { stdout } = await run('ps', ['-Ao', psColumns], { timeout: EXEC_TIMEOUT_MS })
       return parsePs(stdout)
     }),
-    onDarwin
+    plat === 'darwin'
       ? probe('nettop', new Map<number, ProcessNetCounters>(), async () => {
           const { stdout } = await run('nettop', ['-P', '-L', '1', '-n', '-J', 'bytes_in,bytes_out'], { timeout: EXEC_TIMEOUT_MS })
           return parseNettop(stdout)
         })
-      : Promise.resolve(new Map<number, ProcessNetCounters>()),
+      : onLinux && canAttributeSockets()
+        ? probe('ss', new Map<number, ProcessNetCounters>(), async () => {
+            const { stdout } = await run('ss', ['-tinp'], { timeout: EXEC_TIMEOUT_MS })
+            return parseSsTinp(stdout)
+          })
+        : Promise.resolve(new Map<number, ProcessNetCounters>()),
+    onLinux
+      ? probe('nvidia pmon', new Map<number, number>(), async () => {
+          if (!await hasNvidiaSmi()) return new Map<number, number>()
+          const { stdout } = await run('nvidia-smi', ['pmon', '-c', '1'], { timeout: EXEC_TIMEOUT_MS })
+          return parseNvidiaSmiPmon(stdout)
+        })
+      : Promise.resolve(new Map<number, number>()),
   ])
-  return mergeProcesses(psRows, netRows)
+  return mergeGpuPercent(mergeProcesses(psRows, netRows), gpuRows)
 }
 
 /** Full process table ranked and capped (the pc_status / HTTP fallback path). */
@@ -814,7 +993,7 @@ export async function collectStatus(
   const diskstatsStart = onLinux
     ? await probe('diskstats', null as DiskstatSample | null, readDiskstats)
     : null
-  const [disks, processTable, network, gpuPercent, iostatPerSec, pmsetBattery, ioregBattery, swap, vmstat, osVersion, meminfo, linuxBattery] =
+  const [disks, processTable, network, gpuPercent, iostatPerSec, pmsetBattery, ioregBattery, swap, vmstat, osVersion, meminfo, linuxBattery, linuxTemp] =
     await Promise.all([
       probe('df', [] as DiskUsage[], async () => {
         const { stdout } = await run('df', ['-k'], { timeout: EXEC_TIMEOUT_MS })
@@ -829,6 +1008,7 @@ export async function collectStatus(
           }),
       onLinux
         ? probe('gpu nvidia-smi', null as number | null, async () => {
+            if (!await hasNvidiaSmi()) return null
             const { stdout } = await run('nvidia-smi', ['--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'], { timeout: EXEC_TIMEOUT_MS })
             return parseNvidiaSmiGpu(stdout)
           })
@@ -879,6 +1059,9 @@ export async function collectStatus(
       onLinux
         ? probe('power_supply', null as BatteryStatus | null, readLinuxBattery)
         : Promise.resolve(null as BatteryStatus | null),
+      onLinux
+        ? probe('cpu temp', null as number | null, readLinuxCpuTemp)
+        : Promise.resolve(null as number | null),
     ])
 
   // The macOS iostat probe already spans ~1s on its own clock; Linux's probes
@@ -952,6 +1135,7 @@ export async function collectStatus(
       cores: cpuEnd.length,
       usagePercent: cpuUsagePercent(cpuStart, cpuEnd),
       loadavg: [loadavg()[0], loadavg()[1], loadavg()[2]],
+      temperatureCelsius: linuxTemp,
     },
     gpu: { usagePercent: gpuPercent },
     memory: {

@@ -8,10 +8,11 @@
 
 import { describe, expect, it } from 'vitest'
 import {
-  cpuUsagePercent, diffNetRates, diffProcessRates, diskstatRate, mergeProcesses, parseBatteryUevent, parseDf,
-  parseDiskstats, parseIoregBattery, parseIoregGpu, parseIostat, parseMeminfo, parseNetstatIb, parseNettop,
-  parseNvidiaSmiGpu, parseOsRelease, parseProcNetDev, parsePs, parsePmsetBatt, parseSwapUsage, parseVmStat,
-  sortByNetworkRate, sortProcesses, unionProcessRows,
+  canAttributeSockets, cpuUsagePercent, diffNetRates, diffProcessRates, diskstatRate, isCpuTempSource,
+  mergeGpuPercent, mergeProcesses, parseBatteryUevent, parseDf, parseDiskstats, parseIoregBattery,
+  parseIoregGpu, parseIostat, parseMeminfo, parseNetstatIb, parseNettop, parseNvidiaSmiGpu,
+  parseNvidiaSmiPmon, parseOsRelease, parseProcNetDev, parsePs, parsePmsetBatt, parseSsTinp,
+  parseSwapUsage, parseVmStat, pickCpuTempCelsius, sortByNetworkRate, sortProcesses, unionProcessRows,
 } from '../src/monitor.ts'
 import type { DiskstatSample, ProcessRateState } from '../src/monitor.ts'
 import { JUNK_TARGETS, JUNK_TARGETS_DARWIN, JUNK_TARGETS_LINUX, resolveTargets } from '../src/junk.ts'
@@ -598,5 +599,114 @@ describe('parseBatteryUevent', () => {
     const sample = UEVENT_SAMPLE.replace('POWER_SUPPLY_CAPACITY=92\n', '')
       .replace('POWER_SUPPLY_ENERGY_FULL=', 'POWER_SUPPLY_ENERGY_NOW=4370000\nPOWER_SUPPLY_ENERGY_FULL=')
     expect(parseBatteryUevent(sample, null)?.percent).toBe(95)
+  })
+})
+
+const SS_SAMPLE = `State      Recv-Q Send-Q         Local Address:Port             Peer Address:Port Process
+ESTAB      0      0                  127.0.0.1:58516               127.0.0.1:3080  users:(("nginx",pid=3478787,fd=10))
+	 cubic wscale:7,7 rto:204 bytes_sent:1403 bytes_acked:1404 bytes_received:5162993 segs_out:659
+CLOSE-WAIT 25     0                  10.7.62.234:44866         103.102.166.240:443   users:(("uwsgi",pid=2764522,fd=53))
+	 cubic wscale:9,7 rto:248 bytes_acked:1153 bytes_received:42434 segs_out:23
+ESTAB      0      0              10.7.62.234:53862            127.0.0.1:3080  users:(("nginx",pid=3478787,fd=12))
+	 cubic wscale:7,7 rto:204 bytes_sent:900 bytes_acked:901 bytes_received:1000 segs_out:9
+ESTAB      0      0              10.7.62.234:53863            127.0.0.1:3080  users:(("node",pid=100,fd=3),("node",pid=101,fd=3))
+	 cubic wscale:7,7 rto:204 bytes_acked:7 bytes_received:3 segs_out:2
+LISTEN     0      128                      *:22                             *:*   users:(("sshd",pid=9,fd=3))
+`
+
+describe('parseSsTinp (privileged per-process network attribution)', () => {
+  it('sums per-socket counters onto each owning pid across two-line records', () => {
+    const rows = parseSsTinp(SS_SAMPLE)
+    // nginx pid 3478787 owns two sockets: (1403 sent, 5162993 recv) + (900 sent, 1000 recv).
+    expect(rows.get(3478787)).toEqual({ rxBytes: 5163993, txBytes: 2303 })
+    // uwsgi row carries no bytes_sent (older counters): tx falls back to bytes_acked.
+    expect(rows.get(2764522)).toEqual({ rxBytes: 42434, txBytes: 1153 })
+  })
+
+  it('credits a socket shared by several pids to each of them', () => {
+    expect(parseSsTinp(SS_SAMPLE).get(100)).toEqual({ rxBytes: 3, txBytes: 7 })
+    expect(parseSsTinp(SS_SAMPLE).get(101)).toEqual({ rxBytes: 3, txBytes: 7 })
+  })
+
+  it('skips sockets without byte counters (LISTEN) and without owners', () => {
+    const rows = parseSsTinp(SS_SAMPLE)
+    expect(rows.has(9)).toBe(false)
+    expect(parseSsTinp('ESTAB 0 0 a:b c:d\n\t cubic rto:204 bytes_received:5\n').size).toBe(0)
+  })
+
+  it('gates the probe on root: only uid 0 attributes every socket', () => {
+    expect(canAttributeSockets(0)).toBe(true)
+    expect(canAttributeSockets(1000)).toBe(false)
+    // Platforms without getuid (win32) default the uid to undefined, and
+    // undefined === 0 is false — the probe stays off there.
+  })
+})
+
+const PMON_SAMPLE = `# gpu        pid  type    sm   mem   enc   dec   command
+# Idx          #   C/G     %     %     %     %   name
+    0       1234     C    45     2     0     0   python3
+    0       1234     G    60     2     0     0   python3
+    1       1234     C    12     1     0     0   python3
+    0       -1      M     -     0     0     0   -
+    0       5678     C     -     5     0     0   firefox
+`
+
+describe('parseNvidiaSmiPmon (per-process GPU SM)', () => {
+  it('takes the busiest GPU per pid and skips placeholder rows', () => {
+    const rows = parseNvidiaSmiPmon(PMON_SAMPLE)
+    expect(rows.get(1234)).toBe(60)
+    // pid 5678 has no readable sm this sample; pid -1 is not a real pid.
+    expect(rows.has(5678)).toBe(false)
+    expect(rows.size).toBe(1)
+  })
+
+  it('returns empty on comment-only or empty output', () => {
+    expect(parseNvidiaSmiPmon('# gpu pid type sm mem enc dec command').size).toBe(0)
+    expect(parseNvidiaSmiPmon('').size).toBe(0)
+  })
+})
+
+describe('mergeGpuPercent', () => {
+  type ProcessInfo = import('../src/types.ts').ProcessInfo
+  const row = (pid: number): ProcessInfo => ({
+    pid, cpuPercent: 0, memPercent: 0, rssBytes: 0, command: `p${pid}`,
+    netRxBytes: null, netTxBytes: null, gpuPercent: null, diskReadBytes: null, diskWrittenBytes: null,
+  })
+
+  it('attaches SM percent by pid and leaves unmatched rows null', () => {
+    const merged = mergeGpuPercent([row(1), row(2)], new Map([[2, 42]]))
+    expect(merged[0]?.gpuPercent).toBeNull()
+    expect(merged[1]?.gpuPercent).toBe(42)
+  })
+
+  it('returns copies untouched when no gpu rows exist', () => {
+    const rows = [row(1)]
+    expect(mergeGpuPercent(rows, new Map())).toEqual(rows)
+  })
+})
+
+describe('pickCpuTempCelsius', () => {
+  it('accepts the CPU-named chip families and rejects others', () => {
+    for (const name of ['coretemp', 'k10temp', 'zenpower', 'cpu_thermal', 'acpitz', 'x86_pkg_temp', 'soc_dts0']) {
+      expect(isCpuTempSource(name)).toBe(true)
+    }
+    for (const name of ['nvme', 'amdgpu', 'battery', 'iwlwifi', '']) {
+      expect(isCpuTempSource(name)).toBe(false)
+    }
+  })
+
+  it('headlines the max reading across CPU chips, ignoring other chips', () => {
+    const chips = [
+      { name: 'nvme', celsius: [70] },            // disk, ignored
+      { name: 'coretemp', celsius: [41.5, 43.2] }, // per-core inputs: max wins
+      { name: 'k10temp', celsius: [39.9] },
+    ]
+    expect(pickCpuTempCelsius(chips)).toBe(43.2)
+  })
+
+  it('reads null with no candidate chip, and tolerates garbage readings', () => {
+    expect(pickCpuTempCelsius([{ name: 'nvme', celsius: [50] }])).toBeNull()
+    expect(pickCpuTempCelsius([{ name: 'coretemp', celsius: [Number.NaN] }])).toBeNull()
+    expect(pickCpuTempCelsius([])).toBeNull()
   })
 })

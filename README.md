@@ -93,23 +93,36 @@ flatpak 状态）、`/var/cache`、`/lib*`（含运行中内核模块）、`/srv
 
 ## 系统监控指标与数据来源
 
-所有探针按平台分派、失败降级为 null/空值 + `console.warn`，不炸快照（温度需特权、进程级
-GPU/磁盘需特权 helper，均明确不做）。Linux 侧全部读 `/proc` 与 `/sys`，零依赖零提权。
+所有探针按平台分派、失败降级为 null/空值 + `console.warn`，不炸快照。Linux 基础指标全部读
+`/proc` 与 `/sys`，零依赖零提权；**能力检测增强**（进程网络归因、温度、进程级 GPU）遵循
+"检测到能力才启用，缺能力静默 null、不刷 warn"——见下表与 [能力门控](#能力门控探针)。
 
 | 分组 | 指标 | macOS 来源 | Linux 来源 | 解析器 |
 | --- | --- | --- | --- | --- |
 | CPU | 使用率 % | `os.cpus()` 两次采样 250ms 差分 | 同左（采样窗口 ≥1s，见磁盘 I/O） | `cpuUsagePercent` |
 | CPU | 型号/核数/负载 1/5/15 | `node:os` | `node:os` | — |
-| GPU | 使用率 %（尽力而为） | `ioreg -r -d 1 -c IOAccelerator` 的 `Device Utilization %`，多 GPU 取最大 | `nvidia-smi --query-gpu=utilization.gpu`（无 NVIDIA 硬件则 null，UI 整卡隐藏） | `parseIoregGpu` / `parseNvidiaSmiGpu` |
+| CPU | 封装温度 °C | null（`powermetrics` 需 sudo，不代跑） | `/sys/class/hwmon`（name+`temp*_input` 毫度）回退 `/sys/class/thermal`（type+temp）；CPU 系芯片取最大；云主机常无传感器 → null | `pickCpuTempCelsius` / `isCpuTempSource` |
+| GPU | 使用率 %（尽力而为） | `ioreg -r -d 1 -c IOAccelerator` 的 `Device Utilization %`，多 GPU 取最大 | `nvidia-smi --query-gpu=utilization.gpu`（二进制在场缓存探测；无 NVIDIA 硬件则 null，UI 整卡隐藏） | `parseIoregGpu` / `parseNvidiaSmiGpu` |
 | 内存 | macOS: used = active+wired+compressed（回退 total−free）；Linux: used = MemTotal−MemAvailable（回退 total−free−buffers−cached） | `vm_stat`（页大小从头部解析） | `/proc/meminfo`（app≈AnonPages，wired≈SUnreclaim，cached=Buffers+Cached+SReclaimable） | `parseVmStat` / `parseMeminfo` |
 | 内存 | swap 总量/已用 | `sysctl -n vm.swapusage` | `/proc/meminfo` 的 SwapTotal/SwapFree | `parseSwapUsage` / `parseMeminfo` |
 | 磁盘 | 各卷占用 | `df -k` | `df -k`（解析兼容两种列布局；过滤 tmpfs/udev/overlay/squashfs 等伪文件系统与 /dev /proc /sys /run /snap 挂载点） | `parseDf` |
 | 磁盘 | I/O 吞吐（读+写合计） | `iostat -d -c 2` 末样本求和 | `/proc/diskstats` 双采样差分（物理整盘 sd/nvme/vd/hd/mmcblk，排除分区与 loop/dm；采样窗口拉到 1s） | `parseIostat` / `parseDiskstats` + `diskstatRate` |
 | 电池 | 电量/充电/剩余时间/循环/健康度 | `pmset -g batt` + `ioreg -rn AppleSmartBattery` | `/sys/class/power_supply/BAT*/uevent`（AC 从 `A*/online`；无电池隐藏卡片） | `parsePmsetBatt` / `parseIoregBattery` / `parseBatteryUevent` |
 | 网络 | 各接口累计 rx/tx（速率由调用方差分） | `netstat -ib`（排除 lo*，`<Link#>` 行去重） | `/proc/net/dev`（排除 lo） | `parseNetstatIb` / `parseProcNetDev` |
-| 进程网络 | **仪表盘/SSE 帧：实时速率**；**`pc_status` 工具：累计值**——两口径各自成立 | `nettop` 累计 + pump 差分 | 无免提权来源 → 进程网络列恒 null（UI 隐藏该列） | `parseNettop` / `diffProcessRates` |
+| 进程网络 | **仪表盘/SSE 帧：实时速率**；**`pc_status` 工具：累计值**——两口径各自成立 | `nettop` 累计 + pump 差分 | **root 时** `ss -tinp` socket 归因（TCP 口径：当前打开 socket 的 bytes_received/bytes_sent 求和；非 root 整列 null 隐藏） + pump 差分 | `parseNettop` / `parseSsTinp` / `diffProcessRates` |
+| 进程 GPU | SM 利用率 % | null（无来源） | `nvidia-smi pmon -c 1` 按 pid 归因（多 GPU 取最大；无二进制/无占用进程则列隐藏） | `parseNvidiaSmiPmon` / `mergeGpuPercent` |
 | 系统 | 系统版本 | `sw_vers -productVersion` | `/etc/os-release` PRETTY_NAME（如 `Debian GNU/Linux 12 (bookworm)`） | `parseSwVers` / `parseOsRelease` |
-| 进程 | CPU%/内存%(+rss)/网络累计；GPU/磁盘列预留恒 null | `ps -Ao pid,pcpu,pmem,rss,comm` + `nettop`（CSV/JSON 双兼容） | `ps -Ao pid,pcpu,pmem,rss,args`（Linux comm 截断 15 字符，改用 args） | `parsePs` / `parseNettop` / `mergeProcesses` / `sortProcesses` |
+| 进程 | CPU%/内存%(+rss)/网络累计/GPU%；磁盘列预留恒 null | `ps -Ao pid,pcpu,pmem,rss,comm` + `nettop`（CSV/JSON 双兼容） | `ps -Ao pid,pcpu,pmem,rss,args`（Linux comm 截断 15 字符，改用 args）+ `ss -tinp`（root）+ `pmon` | `parsePs` / `parseNettop` / `parseSsTinp` / `mergeProcesses` / `mergeGpuPercent` / `sortProcesses` |
+
+### 能力门控探针
+
+三项"检测到能力才启用"的增强（失败不重试探测、不刷 warn，能力缺失即整列/整行 null，UI 相应隐藏）：
+
+| 探针 | 门控 | 语义与边界 |
+| --- | --- | --- |
+| 进程网络归因 `ss -tinp` | `process.getuid() === 0` | root 下 `ss -p` 才能归属**全部** socket；非 root 只见自家进程，宁可整列不展示。TCP 口径、当前 socket 求和（socket 关闭计数归零，差分窗口自动丢弃该 pid 的速率，不会出负值/假速率） |
+| 温度 hwmon/thermal_zone | 无需特权，传感器在场即读 | CPU 系芯片名（coretemp/k10temp/zenpower/cpu_*/acpitz/x86_pkg_temp/soc_*）取最大读数；nvme/amdgpu 等不计入；云主机无传感器 → null（CPU 卡温度行隐藏） |
+| 进程 GPU `nvidia-smi pmon` | 二进制在场（`/usr/bin`、`/usr/local/bin` 缓存探测一次） | SM 利用率按 pid 归因；`-` 占位行跳过；多 GPU 取最大。无 NVIDIA 硬件的主机探测一次后永不 spawn |
 
 ## 仪表盘（右侧边栏）
 
@@ -209,7 +222,7 @@ pnpm dsh --patch ../dsh-pc-manager/cordis.patch.yml --profile web
 测试与类型检查：
 
 ```sh
-npm test                         # vitest（111 specs，root 环境自动跳过 4 个 EACCES 用例）+ tsc --noEmit，均借 harness 二进制
+npm test                         # vitest（122 specs，root 环境自动跳过 4 个 EACCES 用例）+ tsc --noEmit，均借 harness 二进制
 ```
 
 覆盖全部纯解析器（df 双平台含 Linux 伪文件系统过滤/ps/vm_stat/meminfo/swapusage/os-release/
@@ -250,11 +263,16 @@ glob 展开、走查统计、scan 语义、校验链逐层含符号链接重定�
   /lib*、/boot 等）；trash 三级 Linux 落地（trash-put/gio trash → freedesktop `files/`+`info/`
   带 `.trashinfo` 还原记录 → 跨卷 cp+rm）；工具文案与仪表盘标签平台中性化；测试套件在
   Linux 与 macOS 双平台可绿（平台断言显式注入，root 环境跳过 EACCES 用例）。
+- **M2.10（完成，2026-10-07）**：能力门控探针 —— Linux root 下 `ss -tinp` socket 归因补齐
+  进程级网络（TCP 口径，速率经 pump 差分；非 root 整列隐藏）；`nvidia-smi pmon -c 1` 按 pid
+  归因 SM 利用率（二进制在场缓存探测，缺席不 spawn 不刷 warn）；CPU 封装温度读
+  `/sys/class/hwmon` 回退 `/sys/class/thermal`（CPU 系芯片取最大，`cpu.temperatureCelsius` 进
+  schema 与 CPU 卡片）；`pc_status` description 同步。
 - **M3（规划中）**：应用清单与卸载 —— macOS `/Applications` bundle 走查（du + kMDItemLastUseDate）、
   `brew list` 合并、移废纸篓卸载、残留项（plist/`App Support`/缓存）报告；Linux 侧
   `dpkg-query` 清单与 `rc` 残留清理为后续候选。
-- **未排期**：温度（macOS 需 sudo；Linux hwmon 可读但字段未定）、进程级 GPU/磁盘真实取数
-  （需特权 helper）、Windows、pnpm store 引用计数感知清理、用户持久排除清单。
+- **未排期**：macOS 温度（`powermetrics` 需 sudo，不代跑）、进程级磁盘真实取数（需特权
+  helper）、Windows、pnpm store 引用计数感知清理、用户持久排除清单。
 
 ## License
 

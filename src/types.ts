@@ -53,11 +53,11 @@ export interface ProcessInfo {
   rssBytes: number
   /** Command path or name, truncated by ps to its own width. */
   command: string
-  /** Cumulative inbound bytes since process start; null when unavailable (macOS nettop; no unprivileged Linux source). */
+  /** Cumulative inbound bytes: macOS nettop (since process start); Linux the privileged `ss -tinp` attribution (sum over the process's currently-open TCP sockets); null when no source. */
   netRxBytes: number | null
-  /** Cumulative outbound bytes since process start; null when unavailable (macOS nettop; no unprivileged Linux source). */
+  /** Cumulative outbound bytes: macOS nettop (since process start); Linux the privileged `ss -tinp` attribution (sum over the process's currently-open TCP sockets); null when no source. */
   netTxBytes: number | null
-  /** Per-process GPU percent; needs a privileged helper, so always null today. */
+  /** Per-process GPU SM percent (Linux nvidia-smi pmon, capability-gated); null when no source. */
   gpuPercent: number | null
   /** Per-process disk counters; need a privileged helper, so always null today. */
   diskReadBytes: number | null
@@ -107,6 +107,8 @@ export interface SystemStatus {
     usagePercent: number | null
     /** 1/5/15-minute load averages. */
     loadavg: [number, number, number]
+    /** CPU package temperature °C (Linux hwmon/thermal_zone, capability-gated); null when the host exposes no sensor or the platform needs privileges (macOS powermetrics). */
+    temperatureCelsius: number | null
   }
   /** GPU face; `usagePercent` is best-effort via IOAccelerator and often null. */
   gpu: { usagePercent: number | null }
