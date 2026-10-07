@@ -167,7 +167,10 @@ function CpuCard({ status, history, t }: {
           fifteen: formatLoad(status.cpu.loadavg[2]),
         })}</span>
         <span className='pc-manager-muted'>{t('cpu.cores', { cores: status.cpu.cores })}</span>
-        {status.cpu.temperatureCelsius !== null && (
+        {/* typeof guard: frames from an older host half predate the field
+            (undefined, not null) — a restart-window skew must not crash the
+            card, only hide the line. */}
+        {typeof status.cpu.temperatureCelsius === 'number' && (
           <span className='pc-manager-muted'>
             {t('cpu.temp', { temp: `${status.cpu.temperatureCelsius.toFixed(1)}°C` })}
           </span>
