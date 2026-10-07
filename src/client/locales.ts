@@ -84,6 +84,7 @@ export const zh = {
   'process.column.gpu': 'GPU',
   'process.column.disk': '磁盘',
   'process.unavailable': '—',
+  'process.cpuHint': '相对单核：多核进程可超过 100%（8 核上限 800%）；ps 为进程生命周期平均，非瞬时值；顶部 CPU 卡为整机 0–100% 口径',
 } satisfies Record<string, string>
 
 /** Dictionary key union. */
@@ -161,4 +162,5 @@ export const en = {
   'process.column.gpu': 'GPU',
   'process.column.disk': 'Disk',
   'process.unavailable': '—',
+  'process.cpuHint': 'Relative to one core: multi-core processes can exceed 100% (800% on 8 cores); ps reports a lifetime average, not an instantaneous value; the CPU card above is the whole-system 0–100% scale',
 } satisfies Record<PcManagerKey, string>

@@ -367,7 +367,7 @@ function ProcessCard({ rows, sort, dir, onSortChange, loading, processRates, t }
                   <tr>
                     <th scope='col' className='pc-manager-left'>{t('process.column.command')}</th>
                     <th scope='col' aria-sort={ariaSort('pid')}>{sortButton('pid', t('process.column.pid'))}</th>
-                    <th scope='col' aria-sort={ariaSort('cpu')}>{sortButton('cpu', t('process.column.cpu'))}</th>
+                    <th scope='col' aria-sort={ariaSort('cpu')} title={t('process.cpuHint')}>{sortButton('cpu', t('process.column.cpu'))}</th>
                     <th scope='col' aria-sort={ariaSort('mem')}>{sortButton('mem', t('process.column.mem'))}</th>
                     {hasNet && (
                       <th scope='col' className='pc-manager-col-optional' aria-sort={ariaSort('network')}>
