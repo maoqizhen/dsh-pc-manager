@@ -12,8 +12,12 @@ const CSS = `
   container-type: inline-size; }
 .pc-manager-header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
   padding: 0 2px 2px; }
+.pc-manager-host-block { display: flex; flex-direction: column; min-width: 0; }
 .pc-manager-host { font-size: 13px; font-weight: 600; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
+.pc-manager-host-sub { font-size: 11px; color: color-mix(in srgb, currentColor 62%, transparent);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-variant-numeric: tabular-nums; }
 .pc-manager-uptime { color: color-mix(in srgb, currentColor 62%, transparent); white-space: nowrap; }
 .pc-manager-header-right { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
 .pc-manager-float-toggle { font: inherit; font-size: 11px; padding: 2px 10px; min-height: 24px;

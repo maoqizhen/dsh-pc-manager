@@ -18,10 +18,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import z from '@deepseek-ai/schemastery'
 import {
-  collectStatus, DEFAULT_TOP_PROCESSES, diffNetRates, diffProcessRates, MAX_PROCESS_LIMIT,
-  sortByNetworkRate, unionProcessRows,
+  collectStatus, createIpGeoLookup, DEFAULT_TOP_PROCESSES, diffNetRates, diffProcessRates,
+  MAX_PROCESS_LIMIT, sortByNetworkRate, unionProcessRows,
 } from './monitor.ts'
-import type { ProcessRateState } from './monitor.ts'
+import type { IpGeoLookup, ProcessRateState } from './monitor.ts'
 import { isRecommendedItem, JUNK_TARGETS, RECOMMENDED_PLAN, cleanJunk, scanJunk } from './junk.ts'
 import type { JunkItem } from './types.ts'
 import { PcManagerError } from './types.ts'
@@ -37,6 +37,15 @@ export const MIN_DASHBOARD_POLL_MS = 500
 
 /** Default dashboard poll interval advertised to the web client. */
 export const DEFAULT_DASHBOARD_POLL_MS = 2_000
+
+/** Default public-ip geolocation endpoint (HTTPS, keyless, ipwho.is-compatible JSON). */
+export const DEFAULT_IP_GEO_ENDPOINT = 'https://ipwho.is/'
+
+/** Default minutes a successful public-ip lookup stays cached. */
+export const DEFAULT_IP_GEO_REFRESH_MINUTES = 30
+
+/** Lowest accepted cache minutes — the lookup must not track the poll cadence. */
+export const MIN_IP_GEO_REFRESH_MINUTES = 5
 
 /** Plugin configuration. */
 export interface Config {
@@ -56,6 +65,17 @@ export interface Config {
   maxTopProcesses?: number
   /** Dashboard poll interval in ms, advertised to the web client via response header (default 2000, min 500). */
   dashboardPollMs?: number
+  /**
+   * Look up the public IP's geolocation from an external HTTPS service
+   * (default true). This is the plugin's only outbound third-party request;
+   * the response is cached per {@link ipGeoRefreshMinutes}, and turning this
+   * off leaves `publicIp` null while local addresses keep working.
+   */
+  enableIpGeoLookup?: boolean
+  /** Minutes a successful public-ip lookup stays cached (default 30, min 5). */
+  ipGeoRefreshMinutes?: number
+  /** ipwho.is-compatible HTTPS endpoint for the lookup (default ipwho.is; swap for a reachable mirror). */
+  ipGeoEndpoint?: string
 }
 
 /** Runtime configuration schema. */
@@ -66,6 +86,9 @@ export const Config: z<Config> = z.object({
   askBeforeJunkClean: z.boolean().default(true),
   maxTopProcesses: z.natural().default(DEFAULT_TOP_PROCESSES),
   dashboardPollMs: z.natural().default(DEFAULT_DASHBOARD_POLL_MS),
+  enableIpGeoLookup: z.boolean().default(true),
+  ipGeoRefreshMinutes: z.natural().default(DEFAULT_IP_GEO_REFRESH_MINUTES),
+  ipGeoEndpoint: z.string().default(DEFAULT_IP_GEO_ENDPOINT),
 })
 
 /** Validate the dashboard route's `processSort` query parameter. */
@@ -113,6 +136,7 @@ class SnapshotPump {
   constructor(
     private readonly pollMs: number,
     private readonly maxTop: number,
+    private readonly ipGeo: IpGeoLookup | null = null,
   ) {}
 
   acquire(listener: (frame: DashboardFrame) => void): () => void {
@@ -163,6 +187,7 @@ class SnapshotPump {
         onProcessTable: table => {
           union = unionProcessRows(table, this.maxTop)
         },
+        ipGeo: this.ipGeo,
       })
       const rates = diffNetRates(prev, status)
       const processDiff = diffProcessRates(this.processSeen, union, status.sampledAt)
@@ -189,9 +214,9 @@ class SnapshotPump {
  * JSON route as the fallback for one-shot callers. Headless profiles never
  * inject webServer, so this stays a no-op there.
  */
-function serveDashboard(ctx: Context, pollMs: number, defaultLimit: number): void {  ctx.inject(['webServer'], (webCtx: Context) => {
+function serveDashboard(ctx: Context, pollMs: number, defaultLimit: number, ipGeo: IpGeoLookup | null): void {  ctx.inject(['webServer'], (webCtx: Context) => {
     const webServer = webCtx.webServer
-    const pump = new SnapshotPump(pollMs, defaultLimit)
+    const pump = new SnapshotPump(pollMs, defaultLimit, ipGeo)
     ctx.effect(() => webServer.register({
       kind: 'exact',
       path: '/pc-manager/stream',
@@ -221,7 +246,7 @@ function serveDashboard(ctx: Context, pollMs: number, defaultLimit: number): voi
           // (a different sort or limit) collects on the spot.
           const status = requested === defaultLimit && requestedSort === 'cpu'
             ? (await pump.ensureFresh()).status
-            : await collectStatus(requested, requestedSort)
+            : await collectStatus(requested, requestedSort, { ipGeo })
           res.writeHead(200, {
             'Content-Type': 'application/json; charset=utf-8',
             'Cache-Control': 'no-store',
@@ -346,7 +371,16 @@ function serveJunkFaces(ctx: Context, config: Config): void {
 export function apply(ctx: Context, config: Config = {}): void {
   const pollMs = Math.max(MIN_DASHBOARD_POLL_MS, config.dashboardPollMs ?? DEFAULT_DASHBOARD_POLL_MS)
   const maxTopProcesses = config.maxTopProcesses ?? DEFAULT_TOP_PROCESSES
-  serveDashboard(ctx, pollMs, maxTopProcesses)
+  const ipGeo = config.enableIpGeoLookup ?? true
+    ? createIpGeoLookup({
+      endpoint: config.ipGeoEndpoint ?? DEFAULT_IP_GEO_ENDPOINT,
+      refreshMs: Math.max(MIN_IP_GEO_REFRESH_MINUTES, config.ipGeoRefreshMinutes ?? DEFAULT_IP_GEO_REFRESH_MINUTES) * 60_000,
+    })
+    : null
+  // Warm the cache at startup so the first dashboard frame usually already
+  // carries the geo; the lookup itself swallows every failure.
+  if (ipGeo !== null) void ipGeo()
+  serveDashboard(ctx, pollMs, maxTopProcesses, ipGeo)
   serveJunkFaces(ctx, config)
   registerPcManagerTools(ctx, {
     enableJunkClean: config.enableJunkClean ?? false,
@@ -354,5 +388,6 @@ export function apply(ctx: Context, config: Config = {}): void {
     moveToTrash: config.moveToTrash ?? true,
     askBeforeJunkClean: config.askBeforeJunkClean ?? true,
     maxTopProcesses,
+    ipGeo,
   })
 }

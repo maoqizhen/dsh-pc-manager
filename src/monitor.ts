@@ -10,12 +10,12 @@
 import { execFile } from 'node:child_process'
 import type { Dirent } from 'node:fs'
 import { access, constants as fsConstants, readFile, readdir } from 'node:fs/promises'
-import { hostname, loadavg, cpus, freemem, platform, totalmem, uptime } from 'node:os'
-import type { CpuInfo } from 'node:os'
+import { hostname, loadavg, cpus, freemem, networkInterfaces, platform, totalmem, uptime } from 'node:os'
+import type { CpuInfo, NetworkInterfaceInfo } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import type {
-  BatteryStatus, DiskUsage, NetworkInterface, ProcessInfo, ProcessSort, SystemStatus,
+  BatteryStatus, DiskUsage, NetworkInterface, ProcessInfo, ProcessSort, PublicIpGeo, SystemStatus,
 } from './types.ts'
 
 const run = promisify(execFile)
@@ -692,6 +692,115 @@ export function parseProcNetDev(stdout: string): NetworkInterface[] {
   return interfaces
 }
 
+/**
+ * Local IPv4 selection over `os.networkInterfaces()` — the one address source
+ * that is identical on every platform (no subprocess involved). Internal
+ * (loopback) entries and IPv4 link-local addresses (169.254.x.x, a DHCP miss)
+ * are excluded; remaining addresses keep os order, deduplicated.
+ */
+export function pickLocalAddresses(interfaces: NodeJS.Dict<NetworkInterfaceInfo[]>): string[] {
+  const seen = new Set<string>()
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries ?? []) {
+      if (entry.internal || entry.family !== 'IPv4') continue
+      if (entry.address.startsWith('169.254.') || seen.has(entry.address)) continue
+      seen.add(entry.address)
+    }
+  }
+  return [...seen]
+}
+
+/**
+ * Parse an ipwho.is-compatible lookup body
+ * (`{"ip":"1.2.3.4","success":true,"city":…,"region":…,"country":…,"country_code":"CN"}`).
+ * Missing place fields degrade to null; a body without a usable ip (or
+ * `success:false`, or non-JSON) is null overall.
+ */
+export function parseIpWhoIs(json: string): PublicIpGeo | null {
+  let value: unknown
+  try {
+    value = JSON.parse(json)
+  } catch {
+    return null
+  }
+  if (typeof value !== 'object' || value === null) return null
+  const record = value as Record<string, unknown>
+  if (record.success === false) return null
+  if (typeof record.ip !== 'string' || record.ip.length === 0) return null
+  const text = (key: string): string | null => {
+    const field = record[key]
+    return typeof field === 'string' && field.length > 0 ? field : null
+  }
+  return {
+    ip: record.ip,
+    city: text('city'),
+    region: text('region'),
+    country: text('country'),
+    countryCode: text('country_code'),
+  }
+}
+
+/** Shared public-ip lookup handle: resolves the cached geo or null; never throws. */
+export type IpGeoLookup = () => Promise<PublicIpGeo | null>
+
+export interface IpGeoOptions {
+  endpoint: string
+  /** How long a successful lookup stays cached. */
+  refreshMs: number
+  /** Injectable seams so the cache logic stays unit-testable without network. */
+  fetchImpl?: typeof fetch
+  now?: () => number
+}
+
+const IP_GEO_TIMEOUT_MS = 5_000
+
+/** Retry floor after a failed lookup — a dead endpoint must not be hit once
+ * per snapshot round. */
+const IP_GEO_FAILURE_RETRY_MS = 60_000
+
+/**
+ * Public-IP geolocation behind a TTL cache with single-flight. Successes stay
+ * cached for `refreshMs`, failures for {@link IP_GEO_FAILURE_RETRY_MS}; the
+ * dashboard pump samples every few seconds, so the outbound request rate is
+ * bounded by the cache, not the poll. All errors degrade to null with one
+ * warn per actual attempt — the lookup must never fail a snapshot.
+ */
+export function createIpGeoLookup(options: IpGeoOptions): IpGeoLookup {
+  const doFetch = options.fetchImpl ?? fetch
+  const now = options.now ?? Date.now
+  let cached: PublicIpGeo | null = null
+  let cachedAt = Number.NEGATIVE_INFINITY
+  let inflight: Promise<PublicIpGeo | null> | null = null
+  const fresh = (): boolean => {
+    const ttl = cached === null ? IP_GEO_FAILURE_RETRY_MS : options.refreshMs
+    return now() - cachedAt < ttl
+  }
+  const attempt = async (): Promise<PublicIpGeo | null> => {
+    const response = await doFetch(options.endpoint, { signal: AbortSignal.timeout(IP_GEO_TIMEOUT_MS) })
+    if (!response.ok) throw new Error(`HTTP ${String(response.status)}`)
+    return parseIpWhoIs(await response.text())
+  }
+  return async () => {
+    if (fresh()) return cached
+    inflight ??= attempt()
+      .then(value => {
+        cached = value
+        cachedAt = now()
+        return value
+      })
+      .catch((error: unknown) => {
+        console.warn(`[pc-manager] ip-geo lookup failed: ${String(error)}`)
+        cached = null
+        cachedAt = now()
+        return null
+      })
+      .finally(() => {
+        inflight = null
+      })
+    return inflight
+  }
+}
+
 /** Per-process cumulative byte counters from `nettop`. */
 export interface ProcessNetCounters {
   rxBytes: number
@@ -968,6 +1077,8 @@ export async function listProcesses(sort: ProcessSort = 'cpu', limit = DEFAULT_T
 export interface CollectExtras {
   /** Receives the full merged process table of this round, before ranking. */
   onProcessTable?: (rows: readonly ProcessInfo[]) => void
+  /** Shared TTL-cached public-ip lookup; omitted/null disables the geo field. */
+  ipGeo?: IpGeoLookup | null
 }
 
 /**
@@ -993,7 +1104,7 @@ export async function collectStatus(
   const diskstatsStart = onLinux
     ? await probe('diskstats', null as DiskstatSample | null, readDiskstats)
     : null
-  const [disks, processTable, network, gpuPercent, iostatPerSec, pmsetBattery, ioregBattery, swap, vmstat, osVersion, meminfo, linuxBattery, linuxTemp] =
+  const [disks, processTable, network, gpuPercent, iostatPerSec, pmsetBattery, ioregBattery, swap, vmstat, osVersion, meminfo, linuxBattery, linuxTemp, publicIp] =
     await Promise.all([
       probe('df', [] as DiskUsage[], async () => {
         const { stdout } = await run('df', ['-k'], { timeout: EXEC_TIMEOUT_MS })
@@ -1062,6 +1173,11 @@ export async function collectStatus(
       onLinux
         ? probe('cpu temp', null as number | null, readLinuxCpuTemp)
         : Promise.resolve(null as number | null),
+      // The lookup's own TTL cache bounds the request rate; the first round
+      // may pay one network round-trip (≤5s), after which it resolves cached.
+      extras?.ipGeo === undefined || extras.ipGeo === null
+        ? Promise.resolve(null as PublicIpGeo | null)
+        : probe('ip-geo', null as PublicIpGeo | null, extras.ipGeo),
     ])
 
   // The macOS iostat probe already spans ~1s on its own clock; Linux's probes
@@ -1153,6 +1269,8 @@ export async function collectStatus(
     disks,
     battery,
     network,
+    localIps: pickLocalAddresses(networkInterfaces()),
+    publicIp,
     topProcesses: sortProcesses(processTable, sort, maxTop),
     sampledAt: new Date().toISOString(),
   }

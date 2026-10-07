@@ -55,6 +55,25 @@ function osLabel(platform: string, osVersion: string | null): string {
   return ` · ${platformLabel(platform)} ${osVersion}`
 }
 
+/** Header detail line under the machine name: labeled local addresses and the
+ * public ip with its city. Guards every frame field with typeof — the host
+ * half may be older or newer than this client during restarts — and returns ''
+ * when neither source has data, collapsing the line entirely. */
+function hostDetail(status: SystemStatus, t: TranslateNS<'pcManager'>): string {
+  const parts: string[] = []
+  const localIps = Array.isArray(status.localIps)
+    ? status.localIps.filter(ip => typeof ip === 'string' && ip.length > 0)
+    : []
+  if (localIps.length > 0) parts.push(t('host.localIp', { ip: localIps.join(' · ') }))
+  const geo = status.publicIp
+  if (typeof geo === 'object' && geo !== null && typeof geo.ip === 'string' && geo.ip.length > 0) {
+    const labeled = t('host.publicIp', { ip: geo.ip })
+    const city = typeof geo.city === 'string' && geo.city.length > 0 ? geo.city : null
+    parts.push(city !== null ? `${labeled} · ${city}` : labeled)
+  }
+  return parts.join(' · ')
+}
+
 /** Semantic load tone: glance-readable without reading the number. */
 function toneOf(percent: number | null): 'ok' | 'warn' | 'critical' {
   if (percent === null) return 'ok'
@@ -499,13 +518,17 @@ export function DashboardBody(props: DashboardBodyProps): ReactNode {
   }
 
   const { status } = sample
+  const hostSub = hostDetail(status, t)
   return (
     <div className='pc-manager-body' data-stale={stale}>
       {error !== null && <ErrorBanner error={error} stale={stale} onRetry={refetch} loading={loading} t={t} />}
       <div className='pc-manager-header'>
-        <span className='pc-manager-host'>
-          {status.hostname}
-          {osLabel(status.platform, status.osVersion)}
+        <span className='pc-manager-host-block'>
+          <span className='pc-manager-host'>
+            {status.hostname}
+            {osLabel(status.platform, status.osVersion)}
+          </span>
+          {hostSub !== '' && <span className='pc-manager-host-sub'>{hostSub}</span>}
         </span>
         <span className='pc-manager-header-right'>
           <span className='pc-manager-uptime'>{t('uptime.label', { time: formatUptime(status.uptimeSeconds) })}</span>

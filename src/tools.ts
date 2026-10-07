@@ -11,6 +11,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView, PreToolDecision } from '@deepseek-ai/dsh-tools'
 import { collectStatus } from './monitor.ts'
+import type { IpGeoLookup } from './monitor.ts'
 import { JUNK_KINDS, cleanJunk, describeJunkIds, scanJunk } from './junk.ts'
 import { listApps, uninstallApp } from './apps.ts'
 import type { JunkKind, PcErrorValue } from './types.ts'
@@ -24,6 +25,8 @@ export interface ToolsConfig {
   /** Keep the host-side pre-execute approval prompt for pc_junk_clean (default true). */
   askBeforeJunkClean: boolean
   maxTopProcesses: number
+  /** Shared TTL-cached public-ip lookup; null disables the geo field. */
+  ipGeo: IpGeoLookup | null
 }
 
 const ERROR_SCHEMA = {
@@ -136,6 +139,24 @@ const STATUS_SCHEMA = {
           txBytes: { type: 'number', required: true },
         },
       },
+    },
+    localIps: {
+      type: 'array',
+      required: true,
+      items: { type: 'string' },
+    },
+    publicIp: {
+      oneOf: [{
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ip: { type: 'string', required: true },
+          city: nullable({ type: 'string' }),
+          region: nullable({ type: 'string' }),
+          country: nullable({ type: 'string' }),
+          countryCode: nullable({ type: 'string' }),
+        },
+      }, { type: 'null' as const }],
     },
     topProcesses: {
       type: 'array',
@@ -284,11 +305,12 @@ export function registerPcManagerTools(ctx: Context, config: ToolsConfig): void 
     description: 'Read one system status snapshot: CPU model/cores/utilization/load average '
       + '(and package temperature when the host exposes a sensor), GPU utilization (best-effort), '
       + 'memory pressure breakdown with swap, disk I/O throughput and per-volume usage, battery/power, '
-      + 'per-interface network counters, and ranked processes (CPU, memory, or network). Read-only; '
+      + 'per-interface network counters, local and public IP addresses (public geolocation via an '
+      + 'external lookup, host-configurable), and ranked processes (CPU, memory, or network). Read-only; '
       + 'safe to call any time.',
     parameters: {},
     output: { schema: { oneOf: [STATUS_SCHEMA, ERROR_SCHEMA] }, render: renderValue },
-    execute: () => guarded(() => collectStatus(config.maxTopProcesses)),
+    execute: () => guarded(() => collectStatus(config.maxTopProcesses, 'cpu', { ipGeo: config.ipGeo })),
     presentCall: () => present('System status', 'read'),
   }))
 

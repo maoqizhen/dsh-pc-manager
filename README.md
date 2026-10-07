@@ -115,6 +115,8 @@ flatpak 状态）、`/var/cache`、`/lib*`（含运行中内核模块）、`/srv
 | 磁盘 | I/O 吞吐（读+写合计） | `iostat -d -c 2` 末样本求和 | `/proc/diskstats` 双采样差分（物理整盘 sd/nvme/vd/hd/mmcblk，排除分区与 loop/dm；采样窗口拉到 1s） | `parseIostat` / `parseDiskstats` + `diskstatRate` |
 | 电池 | 电量/充电/剩余时间/循环/健康度 | `pmset -g batt` + `ioreg -rn AppleSmartBattery` | `/sys/class/power_supply/BAT*/uevent`（AC 从 `A*/online`；无电池隐藏卡片） | `parsePmsetBatt` / `parseIoregBattery` / `parseBatteryUevent` |
 | 网络 | 各接口累计 rx/tx（速率由调用方差分） | `netstat -ib`（排除 lo*，`<Link#>` 行去重） | `/proc/net/dev`（排除 lo） | `parseNetstatIb` / `parseProcNetDev` |
+| 网络 | 本机 IPv4 | `node:os` `networkInterfaces()`（非 internal、排除 `169.254.*` 链路本地；**三平台同源，win32 亦可用**） | 同左 | `pickLocalAddresses` |
+| 网络 | 公网 IP 及归属地（可关） | ipwho.is HTTPS 查询（`enableIpGeoLookup` 默认开；成功缓存 `ipGeoRefreshMinutes`（默认 30min、min 5），失败负缓存 60s；端点可经 `ipGeoEndpoint` 替换为兼容镜像） | 同左 | `parseIpWhoIs` / `createIpGeoLookup` |
 | 进程网络 | **仪表盘/SSE 帧：实时速率**；**`pc_status` 工具：累计值**——两口径各自成立 | `nettop` 累计 + pump 差分 | **root 时** `ss -tinp` socket 归因（TCP 口径：当前打开 socket 的 bytes_received/bytes_sent 求和；非 root 整列 null 隐藏） + pump 差分 | `parseNettop` / `parseSsTinp` / `diffProcessRates` |
 | 进程 GPU | SM 利用率 % | null（无来源） | `nvidia-smi pmon -c 1` 按 pid 归因（多 GPU 取最大；无二进制/无占用进程则列隐藏） | `parseNvidiaSmiPmon` / `mergeGpuPercent` |
 | 系统 | 系统版本 | `sw_vers -productVersion` | `/etc/os-release` PRETTY_NAME（如 `Debian GNU/Linux 12 (bookworm)`） | `parseSwVers` / `parseOsRelease` |
@@ -133,7 +135,8 @@ flatpak 状态）、`/var/cache`、`/lib*`（含运行中内核模块）、`/srv
 ## 仪表盘（右侧边栏）
 
 web profile 的右侧边栏"系统监控"入口（order 30），点开是窄列卡片仪表盘：
-头部（主机/系统/运行时长）→ CPU（条+负载+温度行*+sparkline）→ GPU（取不到整卡隐藏）→
+头部（主机/系统 + 次行"本机 … · 公网 IP·城市"（归属地仅城市；查询关闭或未命中时该段
+收缩）/运行时长）→ CPU（条+负载+温度行*+sparkline）→ GPU（取不到整卡隐藏）→
 内存（swap+分解）→ 磁盘（有效卷用量条 + I/O 速率）→ 电池（无电池隐藏）→ 网络（主接口
 速率+sparkline）→ 进程表（按 CPU/内存/网络切换，默认前 10；CPU 列表头悬停显示口径说明）。
 手写 SVG，无图表库。

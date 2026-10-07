@@ -6,13 +6,14 @@
  * @module @deepseek-ai/dsh-pc-manager
  */
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  canAttributeSockets, cpuUsagePercent, diffNetRates, diffProcessRates, diskstatRate, isCpuTempSource,
-  mergeGpuPercent, mergeProcesses, parseBatteryUevent, parseDf, parseDiskstats, parseIoregBattery,
-  parseIoregGpu, parseIostat, parseMeminfo, parseNetstatIb, parseNettop, parseNvidiaSmiGpu,
-  parseNvidiaSmiPmon, parseOsRelease, parseProcNetDev, parsePs, parsePmsetBatt, parseSsTinp,
-  parseSwapUsage, parseVmStat, pickCpuTempCelsius, sortByNetworkRate, sortProcesses, unionProcessRows,
+  canAttributeSockets, cpuUsagePercent, createIpGeoLookup, diffNetRates, diffProcessRates,
+  diskstatRate, isCpuTempSource, mergeGpuPercent, mergeProcesses, parseBatteryUevent, parseDf,
+  parseDiskstats, parseIoregBattery, parseIoregGpu, parseIostat, parseIpWhoIs, parseMeminfo,
+  parseNetstatIb, parseNettop, parseNvidiaSmiGpu, parseNvidiaSmiPmon, parseOsRelease, parseProcNetDev,
+  parsePs, parsePmsetBatt, parseSsTinp, parseSwapUsage, parseVmStat, pickCpuTempCelsius,
+  pickLocalAddresses, sortByNetworkRate, sortProcesses, unionProcessRows,
 } from '../src/monitor.ts'
 import type { DiskstatSample, ProcessRateState } from '../src/monitor.ts'
 import { JUNK_TARGETS, JUNK_TARGETS_DARWIN, JUNK_TARGETS_LINUX, resolveTargets } from '../src/junk.ts'
@@ -708,5 +709,140 @@ describe('pickCpuTempCelsius', () => {
     expect(pickCpuTempCelsius([{ name: 'nvme', celsius: [50] }])).toBeNull()
     expect(pickCpuTempCelsius([{ name: 'coretemp', celsius: [Number.NaN] }])).toBeNull()
     expect(pickCpuTempCelsius([])).toBeNull()
+  })
+})
+
+describe('pickLocalAddresses', () => {
+  it('keeps non-internal IPv4 in os order, dropping loopback, link-local, IPv6, and duplicates', () => {
+    const addresses = pickLocalAddresses({
+      lo0: [{ address: '127.0.0.1', netmask: '255.0.0.0', family: 'IPv4', mac: '00:00:00:00:00:00', internal: true, cidr: null }],
+      en0: [
+        { address: '192.168.3.12', netmask: '255.255.255.0', family: 'IPv4', mac: 'd0:11:e5:8d:80:45', internal: false, cidr: null },
+        { address: 'fe80::1%en0', netmask: 'ffff:ffff:ffff:ffff::', family: 'IPv6', mac: 'd0:11:e5:8d:80:45', internal: false, scopeid: 1, cidr: null },
+      ],
+      bridge100: [{ address: '169.254.5.9', netmask: '255.255.0.0', family: 'IPv4', mac: '9a:11:e5:8d:80:45', internal: false, cidr: null }],
+      en1: [{ address: '192.168.3.12', netmask: '255.255.255.0', family: 'IPv4', mac: 'd0:11:e5:8d:80:46', internal: false, cidr: null }],
+    })
+    expect(addresses).toEqual(['192.168.3.12'])
+  })
+
+  it('collects one address per qualifying interface (windows-style mixed stack)', () => {
+    const addresses = pickLocalAddresses({
+      'Loopback Pseudo-Interface 1': [{ address: '127.0.0.1', netmask: '255.0.0.0', family: 'IPv4', mac: '', internal: true, cidr: null }],
+      eth0: [{ address: '10.0.0.5', netmask: '255.255.0.0', family: 'IPv4', mac: 'aa:bb:cc:dd:ee:01', internal: false, cidr: null }],
+      wlan0: [
+        { address: 'fe80::2%wlan0', netmask: 'ffff:ffff:ffff:ffff::', family: 'IPv6', mac: 'aa:bb:cc:dd:ee:02', internal: false, scopeid: 3, cidr: null },
+        { address: '172.17.8.4', netmask: '255.255.248.0', family: 'IPv4', mac: 'aa:bb:cc:dd:ee:02', internal: false, cidr: null },
+      ],
+    })
+    expect(addresses).toEqual(['10.0.0.5', '172.17.8.4'])
+  })
+
+  it('returns empty when nothing qualifies', () => {
+    expect(pickLocalAddresses({})).toEqual([])
+    expect(pickLocalAddresses({
+      lo0: [{ address: '127.0.0.1', netmask: '255.0.0.0', family: 'IPv4', mac: '', internal: true, cidr: null }],
+      utun3: [{ address: 'fe80::4%utun3', netmask: 'ffff:ffff:ffff:ffff::', family: 'IPv6', mac: '', internal: false, scopeid: 9, cidr: null }],
+    })).toEqual([])
+  })
+})
+
+describe('parseIpWhoIs', () => {
+  it('maps a full payload onto the geo shape', () => {
+    const body = '{"ip":"203.0.113.7","success":true,"country":"China","country_code":"CN","region":"Guangdong","city":"Shenzhen"}'
+    expect(parseIpWhoIs(body)).toEqual({
+      ip: '203.0.113.7', city: 'Shenzhen', region: 'Guangdong', country: 'China', countryCode: 'CN',
+    })
+  })
+
+  it('degrades missing place fields to null', () => {
+    expect(parseIpWhoIs('{"ip":"198.51.100.2"}')).toEqual({
+      ip: '198.51.100.2', city: null, region: null, country: null, countryCode: null,
+    })
+    expect(parseIpWhoIs('{"ip":"198.51.100.2","city":"","country_code":8}')).toEqual({
+      ip: '198.51.100.2', city: null, region: null, country: null, countryCode: null,
+    })
+  })
+
+  it('rejects success:false and bodies without a usable ip', () => {
+    expect(parseIpWhoIs('{"ip":"203.0.113.7","success":false}')).toBeNull()
+    expect(parseIpWhoIs('{"success":true}')).toBeNull()
+    expect(parseIpWhoIs('{"ip":""}')).toBeNull()
+    expect(parseIpWhoIs('{"ip":42}')).toBeNull()
+  })
+
+  it('returns null on non-JSON garbage and empty input', () => {
+    expect(parseIpWhoIs('<html>blocked</html>')).toBeNull()
+    expect(parseIpWhoIs('')).toBeNull()
+    expect(parseIpWhoIs('null')).toBeNull()
+  })
+})
+
+describe('createIpGeoLookup', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  const OK_BODY = '{"ip":"203.0.113.7","country":"China","country_code":"CN"}'
+  const asFetch = (impl: () => Promise<{ ok: boolean, status: number, text: () => Promise<string> }>): typeof fetch =>
+    impl as unknown as typeof fetch
+
+  it('serves from cache within the TTL and refetches once it lapses', async () => {
+    let clock = 0
+    const calls: string[] = []
+    const lookup = createIpGeoLookup({
+      endpoint: 'https://example.test/geo',
+      refreshMs: 1_000,
+      now: () => clock,
+      fetchImpl: asFetch(async () => {
+        calls.push('fetch')
+        return { ok: true, status: 200, text: async () => OK_BODY }
+      }),
+    })
+    await expect(lookup()).resolves.toMatchObject({ ip: '203.0.113.7' })
+    clock = 500
+    await lookup()
+    expect(calls).toHaveLength(1)
+    clock = 1_500
+    await expect(lookup()).resolves.toMatchObject({ ip: '203.0.113.7' })
+    expect(calls).toHaveLength(2)
+  })
+
+  it('negative-caches failures so a dead endpoint is not retried every round', async () => {
+    let clock = 0
+    let attempts = 0
+    const lookup = createIpGeoLookup({
+      endpoint: 'https://dead.test/',
+      refreshMs: 60_000,
+      now: () => clock,
+      fetchImpl: asFetch(async () => {
+        attempts += 1
+        throw new Error('network down')
+      }),
+    })
+    await expect(lookup()).resolves.toBeNull()
+    await expect(lookup()).resolves.toBeNull()
+    expect(attempts).toBe(1)
+    clock = 61_000
+    await expect(lookup()).resolves.toBeNull()
+    expect(attempts).toBe(2)
+    expect(console.warn).toHaveBeenCalledTimes(2)
+  })
+
+  it('resolves null on HTTP errors and unparseable bodies without throwing', async () => {
+    const httpError = createIpGeoLookup({
+      endpoint: 'https://example.test/geo', refreshMs: 60_000, now: () => 0,
+      fetchImpl: asFetch(async () => ({ ok: false, status: 503, text: async () => '' })),
+    })
+    await expect(httpError()).resolves.toBeNull()
+    const garbage = createIpGeoLookup({
+      endpoint: 'https://example.test/geo', refreshMs: 60_000, now: () => 0,
+      fetchImpl: asFetch(async () => ({ ok: true, status: 200, text: async () => 'not json' })),
+    })
+    await expect(garbage()).resolves.toBeNull()
   })
 })

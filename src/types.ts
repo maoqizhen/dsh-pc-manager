@@ -93,6 +93,17 @@ export interface NetworkInterface {
   txBytes: number
 }
 
+/** Public-IP geolocation from an external lookup (ipwho.is-compatible JSON). */
+export interface PublicIpGeo {
+  ip: string
+  city: string | null
+  region: string | null
+  /** Country name as the service reports it (English, e.g. `China`). */
+  country: string | null
+  /** ISO 3166-1 alpha-2 code, e.g. `CN`; lets clients localize the name. */
+  countryCode: string | null
+}
+
 /** Read-only system snapshot; sampling never mutates host state. */
 export interface SystemStatus {
   platform: string
@@ -131,6 +142,10 @@ export interface SystemStatus {
   disks: DiskUsage[]
   battery: BatteryStatus | null
   network: NetworkInterface[]
+  /** Local IPv4 addresses (`node:os` networkInterfaces — cross-platform; non-internal, link-local excluded, one per interface). */
+  localIps: string[]
+  /** Public-IP geolocation (external HTTPS lookup, config-gated with a TTL cache); null when disabled or unreachable. */
+  publicIp: PublicIpGeo | null
   topProcesses: ProcessInfo[]
   sampledAt: string
 }
