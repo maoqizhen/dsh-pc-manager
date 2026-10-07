@@ -292,12 +292,12 @@ export function registerPcManagerTools(ctx: Context, config: ToolsConfig): void 
 
   ctx.tools.register(defineTool({
     name: 'pc_junk_scan',
-    description: 'Enumerate reclaimable junk on this Mac — Trash, user caches/logs, system temp, '
-      + 'iOS device backups, Xcode build artifacts, simulator leftovers, and package-manager caches '
-      + '— with per-item sizes, safety notes, and suggested commands for items that must not be '
-      + 'deleted directly. Always a dry run: scanning deletes nothing. After scanning, present a '
-      + 'per-category summary to the user and ask which categories or items to clean — prefer the '
-      + 'ask_user_question tool for that choice when it is available — before ever calling '
+    description: 'Enumerate reclaimable junk on this host — Trash, user caches, system temp, package-manager '
+      + 'caches (npm/pnpm/pip/uv/yarn/go/Homebrew), and on macOS also user logs, Xcode build artifacts, '
+      + 'simulator leftovers, and iOS device backups — with per-item sizes, safety notes, and suggested '
+      + 'commands for items that must not be deleted directly. Always a dry run: scanning deletes nothing. '
+      + 'After scanning, present a per-category summary to the user and ask which categories or items to '
+      + 'clean — prefer the ask_user_question tool for that choice when it is available — before ever calling '
       + 'pc_junk_clean.',
     parameters: {
       kinds: {
@@ -357,8 +357,9 @@ export function registerPcManagerTools(ctx: Context, config: ToolsConfig): void 
 
   ctx.tools.register(defineTool({
     name: 'pc_apps_list',
-    description: 'List installed applications (app bundles and Homebrew formulae/casks) with '
-      + 'sizes and last-launch times when observable. Read-only.',
+    description: 'List installed applications (app bundles and Homebrew formulae/casks on macOS; '
+      + 'distro packages on Linux once M3 lands) with sizes and last-launch times when observable. '
+      + 'Read-only.',
     parameters: {},
     output: { schema: { oneOf: [APPS_LIST_SCHEMA, ERROR_SCHEMA] }, render: renderValue },
     execute: () => guarded(() => listApps()),

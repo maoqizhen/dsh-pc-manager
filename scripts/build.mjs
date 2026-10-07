@@ -31,5 +31,9 @@ function findHarness() {
 const harness = findHarness()
 const tsdown = path.join(harness, 'node_modules/.bin/tsdown')
 const config = path.join(pkgRoot, 'tsdown.config.ts')
-const result = spawnSync(tsdown, ['--config', config], { stdio: 'inherit', cwd: harness })
+// --config-loader native: tsdown's default TS-config loader (unrun) is not a
+// harness dependency; the native loader type-strips the config directly —
+// which Node <23 gates behind --experimental-strip-types.
+const env = { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --experimental-strip-types`.trim() }
+const result = spawnSync(tsdown, ['--config-loader', 'native', '--config', config], { stdio: 'inherit', cwd: harness, env })
 process.exit(result.status ?? 1)

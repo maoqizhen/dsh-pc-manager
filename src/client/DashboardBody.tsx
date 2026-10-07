@@ -39,6 +39,22 @@ function percentLabel(value: number | null): string {
   return value === null ? '—' : `${value.toFixed(1)}%`
 }
 
+/** Friendly platform name for volume labels. */
+function platformLabel(platform: string): string {
+  if (platform === 'darwin') return 'macOS'
+  if (platform === 'linux') return 'Linux'
+  return platform
+}
+
+/** Header OS line: macOS prefixes its product version; Linux PRETTY_NAME
+ * already names the distro (`Debian GNU/Linux 12 (bookworm)`). */
+function osLabel(platform: string, osVersion: string | null): string {
+  if (osVersion === null) return ''
+  if (platform === 'darwin') return ` · macOS ${osVersion}`
+  if (platform === 'linux') return ` · ${osVersion}`
+  return ` · ${platformLabel(platform)} ${osVersion}`
+}
+
 /** Semantic load tone: glance-readable without reading the number. */
 function toneOf(percent: number | null): 'ok' | 'warn' | 'critical' {
   if (percent === null) return 'ok'
@@ -123,13 +139,14 @@ function topInterface(sample: DashboardSample): { name: string, rxPerSec: number
   return best === null ? null : { name: best.name, rxPerSec: best.rxPerSec, txPerSec: best.txPerSec }
 }
 
-/** Volume rows worth a dashboard card: the boot volume, its Data overlay, and
- * user data mounts. Recovery is a frozen system volume; the domain snapshot
- * keeps every volume for the model. */
+/** Volume rows worth a dashboard card: the boot volume, macOS data overlays,
+ * and user data mounts on both platforms. Recovery is a frozen system volume;
+ * the domain snapshot keeps every volume for the model. */
 function dashboardVolumes(disks: SystemStatus['disks']): SystemStatus['disks'] {
   return disks.filter(disk =>
     disk.mount === '/' || disk.mount === '/System/Volumes/Data'
-    || (disk.mount.startsWith('/Volumes/') && disk.mount !== '/Volumes/Recovery'))
+    || (disk.mount.startsWith('/Volumes/') && disk.mount !== '/Volumes/Recovery')
+    || disk.mount.startsWith('/media/') || disk.mount.startsWith('/mnt/'))
 }
 
 function CpuCard({ status, history, t }: {
@@ -186,20 +203,22 @@ function MemoryCard({ status, t }: { status: SystemStatus, t: TranslateNS<'pcMan
 
 function DisksCard({ status, t }: { status: SystemStatus, t: TranslateNS<'pcManager'> }): ReactNode {
   const io = status.diskIo.totalBytesPerSec
+  const rootLabel = platformLabel(status.platform)
   return (
     <section className='pc-manager-card'>
       {cardHeading(t('card.disks'), io === null ? '—' : `I/O ${formatRate(io)}`)}
       {dashboardVolumes(status.disks).map(disk => {
         const percent = disk.totalBytes > 0 ? disk.usedBytes / disk.totalBytes * 100 : null
+        const label = disk.mount === '/' ? rootLabel : disk.mount
         return (
           <div key={disk.mount} className='pc-manager-vol'>
             <div className='pc-manager-row'>
-              <span className='pc-manager-muted'>{disk.mount === '/' ? 'macOS' : disk.mount}</span>
+              <span className='pc-manager-muted'>{label}</span>
               <span className='pc-manager-muted'>
                 {formatBytes(disk.usedBytes)} / {formatBytes(disk.totalBytes)}
               </span>
             </div>
-            <UsageBar percent={percent} label={disk.mount === '/' ? 'macOS' : disk.mount} />
+            <UsageBar percent={percent} label={label} />
           </div>
         )
       })}
@@ -478,7 +497,7 @@ export function DashboardBody(props: DashboardBodyProps): ReactNode {
       <div className='pc-manager-header'>
         <span className='pc-manager-host'>
           {status.hostname}
-          {status.osVersion !== null ? ` · macOS ${status.osVersion}` : ''}
+          {osLabel(status.platform, status.osVersion)}
         </span>
         <span className='pc-manager-header-right'>
           <span className='pc-manager-uptime'>{t('uptime.label', { time: formatUptime(status.uptimeSeconds) })}</span>

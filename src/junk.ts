@@ -1,16 +1,17 @@
 /**
- * System junk cleanup (垃圾清理). The target registry is the core safety
- * asset — which paths count as junk, why, and how safe they are — while
- * scanJunk (size walk, always dry-run) and cleanJunk (validation chain plus
- * Trash-first reclaim) are the executors. Pure node:fs, zero cordis, so the
- * module stays unit-testable outside the harness.
+ * System junk cleanup (垃圾清理) for macOS and Linux hosts. The target
+ * registries (one per platform) are the core safety asset — which paths count
+ * as junk, why, and how safe they are — while scanJunk (size walk, always
+ * dry-run) and cleanJunk (validation chain plus Trash-first reclaim) are the
+ * executors. Pure node:fs, zero cordis, so the module stays unit-testable
+ * outside the harness.
  * @module @deepseek-ai/dsh-pc-manager
  */
 
 import { execFile } from 'node:child_process'
 import { constants as fsConstants } from 'node:fs'
 import type { Dirent, Stats } from 'node:fs'
-import { access, cp, lstat, mkdir, readdir, realpath, rename, rm } from 'node:fs/promises'
+import { access, cp, lstat, mkdir, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir, platform } from 'node:os'
 import { basename, join, normalize } from 'node:path'
 import { promisify } from 'node:util'
@@ -44,9 +45,10 @@ export interface JunkTarget {
 }
 
 /**
- * Sensitive-cache protection list for `~/Library/Caches`: "caches" that hold
- * non-regenerable state (password vaults, IDE indexes, input-method lexicons,
- * VPN configs, sync clients, AI apps). Self-built — concept references only.
+ * Sensitive-cache protection list for macOS `~/Library/Caches`: "caches" that
+ * hold non-regenerable state (password vaults, IDE indexes, input-method
+ * lexicons, VPN configs, sync clients, AI apps). Self-built — concept
+ * references only.
  */
 export const PROTECTED_CHILDREN: readonly string[] = [
   // password managers / key material
@@ -64,6 +66,27 @@ export const PROTECTED_CHILDREN: readonly string[] = [
 ]
 
 /**
+ * The same protection concept for Linux `~/.cache`, where directories are
+ * named after the app (XDG convention) instead of a reverse-DNS bundle id.
+ * Over-blocking is the safe direction: rules are prefixes.
+ */
+export const LINUX_PROTECTED_CHILDREN: readonly string[] = [
+  // password managers / key material
+  '1password', 'bitwarden', 'keepass', 'keepassxc', 'lastpass', 'dashlane',
+  // IDEs / editors (indexes and window state are not regenerable cheaply)
+  'jetbrains', 'vscode', 'Code', 'sublime-text', 'sublime',
+  // input methods (user lexicons live in the "cache")
+  'fcitx', 'ibus', 'rime',
+  // VPN / proxy clients (profiles and keys are not regenerable)
+  'clash', 'Clash', 'tailscale', 'Tailscale', 'openvpn', 'OpenVPN',
+  'wireguard', 'WireGuard', 'zerotier', 'mullvad',
+  // sync clients (local change journals)
+  'dropbox', 'Dropbox', 'onedrive', 'OneDrive', 'google-drive', 'nextcloud', 'syncthing',
+  // AI apps (may hold local sessions/models)
+  'ollama', 'jan', 'lm-studio', 'claude', 'Claude',
+]
+
+/**
  * Endpoint-security (EDR) prefixes for `system-temp`: deleting an enterprise
  * agent's cache triggers tamper alerts (e.g. CrowdStrike Falcon sensor), which
  * IT reads as a security incident. Protected unconditionally.
@@ -71,6 +94,19 @@ export const PROTECTED_CHILDREN: readonly string[] = [
 export const EDR_PROTECTED_PREFIXES: readonly string[] = [
   'com.crowdstrike.', 'com.sentinelone.', 'com.sentinel-labs.', 'com.eset.',
   'com.jamf.', 'com.jamfsoftware.', 'com.paloaltonetworks.', 'com.cisco.anyconnect', 'com.cisco.secureclient',
+]
+
+/**
+ * Linux `system-temp` protections: live systemd/snap private dirs under /tmp
+ * and /var/tmp belong to running services, and Linux EDR agents (falcon,
+ * sentinelone, defender…) trip tamper alerts like their macOS peers.
+ */
+export const LINUX_TEMP_PROTECTED: readonly string[] = [
+  // live service state: deleting these breaks running services
+  'systemd-private-', 'snap-private-tmp',
+  // endpoint-security agents (tamper alerts)
+  'falcon', 'crowdstrike', 'sentinelone', 's1agent', 'carbonblack', 'cb-defense',
+  'mde', 'sophos', 'defender',
 ]
 
 /**
@@ -89,7 +125,7 @@ export function matchesProtectedRule(name: string, rule: string): boolean {
  * `safeToClean: false` rows are reported by scan but refused by clean, with a
  * suggested command in the rationale.
  */
-export const JUNK_TARGETS: readonly JunkTarget[] = [
+export const JUNK_TARGETS_DARWIN: readonly JunkTarget[] = [
   {
     kind: 'trash',
     label: '废纸篓 (~/.Trash)',
@@ -259,23 +295,156 @@ export const JUNK_TARGETS: readonly JunkTarget[] = [
 ]
 
 /**
+ * Linux junk families (XDG layout), 11 kinds over 12 rows (`system-temp` has
+ * two roots). macOS-only kinds (user-logs, the Xcode/simulator families,
+ * ios-backups) have no Linux rows: absent roots never produce items anyway,
+ * and the kind vocabulary stays closed for schema stability. Command-shaped
+ * reclaim targets (apt autoremove, journalctl vacuum, snap old revisions,
+ * flatpak --unused, docker prune) are deliberately NOT rows — the registry
+ * only reclaims paths; those live in the README as suggested commands.
+ */
+export const JUNK_TARGETS_LINUX: readonly JunkTarget[] = [
+  {
+    kind: 'trash',
+    label: '回收站 (~/.local/share/Trash)',
+    dir: '~/.local/share/Trash',
+    safeToClean: true,
+    rationale: 'Files the user already discarded (freedesktop trash); emptying is the normal trash '
+      + 'operation. Whole-root granularity also keeps individual trashed file names private.',
+    granularity: 'whole',
+  },
+  {
+    kind: 'user-caches',
+    label: '用户缓存 (~/.cache)',
+    dir: '~/.cache',
+    safeToClean: true,
+    rationale: 'XDG per-app caches that apps rebuild on demand (including ~/.cache/thumbnails, which '
+      + 'the file manager regenerates). Sensitive caches (password managers, IDEs, input methods, VPN, '
+      + 'sync clients) are excluded by the protected-children list.',
+    granularity: 'children',
+    protectedChildren: LINUX_PROTECTED_CHILDREN,
+  },
+  {
+    kind: 'system-temp',
+    label: '系统临时文件 (/tmp)',
+    dir: '/tmp',
+    safeToClean: true,
+    rationale: 'Active temporary files must not move; only children untouched for at least 3 days are '
+      + 'reported. systemd private dirs (systemd-private-*) and snap-private-tmp belong to running '
+      + 'services and are excluded, as are endpoint-security agent directories (deleting them triggers '
+      + 'tamper alerts).',
+    granularity: 'children',
+    minAgeDays: 3,
+    protectedChildren: LINUX_TEMP_PROTECTED,
+  },
+  {
+    kind: 'system-temp',
+    label: '系统临时文件 (/var/tmp)',
+    dir: '/var/tmp',
+    safeToClean: true,
+    rationale: 'Persistent temporary files (survive reboots by convention); only children untouched '
+      + 'for at least 3 days are reported, with the same live-service and endpoint-security exclusions '
+      + 'as /tmp.',
+    granularity: 'children',
+    minAgeDays: 3,
+    protectedChildren: LINUX_TEMP_PROTECTED,
+  },
+  {
+    kind: 'npm-cache',
+    label: 'npm 缓存 (~/.npm/_cacache)',
+    dir: '~/.npm/_cacache',
+    safeToClean: true,
+    rationale: 'Content-addressed tarball cache; `npm cache clean --force` equivalent. '
+      + 'Sibling `_logs`/`_npx` are deliberately left alone.',
+    granularity: 'whole',
+  },
+  {
+    kind: 'pnpm-store',
+    label: 'pnpm 内容存储 (~/.local/share/pnpm/store)',
+    dir: '~/.local/share/pnpm/store',
+    safeToClean: false,
+    rationale: 'Hard-link source for every installed dependency; direct deletion breaks linked '
+      + 'node_modules. Run `pnpm store prune` instead.',
+    granularity: 'children',
+  },
+  {
+    kind: 'homebrew-cache',
+    label: 'Homebrew 下载缓存 (~/.cache/Homebrew)',
+    dir: '~/.cache/Homebrew',
+    safeToClean: true,
+    rationale: 'Downloaded bottles (Linuxbrew); `brew cleanup` equivalent.',
+    granularity: 'children',
+  },
+  {
+    kind: 'pip-cache',
+    label: 'pip 缓存 (~/.cache/pip)',
+    dir: '~/.cache/pip',
+    safeToClean: true,
+    rationale: 'Wheel download cache; rebuilt on demand.',
+    granularity: 'whole',
+  },
+  {
+    kind: 'uv-cache',
+    label: 'uv 缓存 (~/.cache/uv)',
+    dir: '~/.cache/uv',
+    safeToClean: true,
+    rationale: 'Wheel and source cache; rebuilt on demand.',
+    granularity: 'whole',
+  },
+  {
+    kind: 'yarn-cache',
+    label: 'Yarn 缓存 (~/.cache/yarn)',
+    dir: '~/.cache/yarn',
+    safeToClean: true,
+    rationale: 'Yarn 1.x package cache; `yarn cache clean` equivalent (on berry installs run that command).',
+    granularity: 'whole',
+  },
+  {
+    kind: 'go-build-cache',
+    label: 'Go 构建缓存 (~/.cache/go-build)',
+    dir: '~/.cache/go-build',
+    safeToClean: true,
+    rationale: 'Compiled package cache; rebuilt on demand.',
+    granularity: 'whole',
+  },
+  {
+    kind: 'go-mod-cache',
+    label: 'Go 模块缓存 (~/go/pkg/mod/cache)',
+    dir: '~/go/pkg/mod/cache',
+    safeToClean: true,
+    rationale: 'Downloaded module cache (conservative subtree of ~/go/pkg/mod); re-downloaded on demand.',
+    granularity: 'whole',
+  },
+]
+
+/** The current platform's registry (the safety asset the tools scan). */
+export const JUNK_TARGETS: readonly JunkTarget[] =
+  platform() === 'linux' ? JUNK_TARGETS_LINUX : JUNK_TARGETS_DARWIN
+
+/**
  * Kinds whose deletion costs non-regenerable data (§3.2 ✅* rows): excluded
  * from the recommended pre-selection — the UI shows them unchecked by default.
  */
 const NON_REGENERABLE_KINDS: readonly JunkKind[] = ['xcode-archives', 'ios-backups']
 
 /**
- * The pre-checked cleanup plan the dashboard presents (§16.2): every
- * safe-to-clean kind minus the non-regenerable ones, items at or above
- * 1 MiB. Safety-policy data in the registry's own league — not a Config knob.
+ * The pre-checked cleanup plan for one registry (§16.2): every safe-to-clean
+ * kind minus the non-regenerable ones, items at or above 1 MiB. Safety-policy
+ * data in the registry's own league — not a Config knob.
  */
-export const RECOMMENDED_PLAN: Readonly<{ kinds: readonly JunkKind[], minItemBytes: number }> = Object.freeze({
-  kinds: Object.freeze(JUNK_KINDS.filter(kind => {
-    const rows = JUNK_TARGETS.filter(target => target.kind === kind)
+export function computeRecommendedPlan(
+  targets: readonly JunkTarget[] = JUNK_TARGETS,
+): Readonly<{ kinds: readonly JunkKind[], minItemBytes: number }> {
+  const kinds = JUNK_KINDS.filter(kind => {
+    const rows = targets.filter(target => target.kind === kind)
     return rows.length > 0 && rows.every(row => row.safeToClean) && !NON_REGENERABLE_KINDS.includes(kind)
-  })),
-  minItemBytes: 1024 * 1024,
-})
+  })
+  return Object.freeze({ kinds: Object.freeze(kinds), minItemBytes: 1024 * 1024 })
+}
+
+/** The current platform's pre-checked cleanup plan. */
+export const RECOMMENDED_PLAN: Readonly<{ kinds: readonly JunkKind[], minItemBytes: number }> =
+  computeRecommendedPlan()
 
 /** True when the UI plan card pre-checks this item. */
 export function isRecommendedItem(item: Pick<JunkItem, 'kind' | 'sizeBytes'>): boolean {
@@ -284,12 +453,19 @@ export function isRecommendedItem(item: Pick<JunkItem, 'kind' | 'sizeBytes'>): b
 
 /**
  * Blocked system paths (defense in depth above root containment, guarding
- * against future registry misconfiguration). `~/Library/Containers` variants
- * are prefix-blocked because containers are app state, not cache; `$HOME` and
- * `~/Library` block equality only — their descendants are where junk lives.
+ * against future registry misconfiguration). The list is the UNION of both
+ * platforms' red lines — blocking an extra system tree can only refuse more,
+ * never allow more — and is evaluated identically everywhere: macOS
+ * (`/System`, `/private/var/db`, `~/Library/Containers`…), Linux (`/etc`,
+ * `/boot`, `/var/lib` covering dpkg/snapd/flatpak state, `/lib*` covering
+ * running kernel modules…). `$HOME` and `~/Library` block equality only —
+ * their descendants are where junk lives.
  */
 const BLOCKED_PREFIXES: readonly string[] = [
-  '/System', '/usr', '/bin', '/sbin', '/private/var/db', '/private/etc', '/Library',
+  '/System', '/usr', '/bin', '/sbin', '/etc', '/boot', '/srv',
+  '/private/var/db', '/private/etc', '/Library',
+  '/var/log', '/var/lib', '/var/db', '/var/cache',
+  '/lib', '/lib64', '/lib32', '/libx32',
   '~/Library/Containers', '~/Library/Group Containers',
 ]
 
@@ -297,17 +473,22 @@ const BLOCKED_PREFIXES: readonly string[] = [
 export function isBlockedPath(path: string, home: string): boolean {
   const p = normalize(path)
   const h = normalize(home)
-  if (p === h || p === `${h}/Library` || p === '/Users') return true
+  if (p === h || p === `${h}/Library` || p === '/Users' || p === '/home') return true
   for (const blocked of BLOCKED_PREFIXES) {
     const b = normalize(blocked.replace(/^~(?=\/)/, h))
     if (p === b || p.startsWith(`${b}/`)) return true
   }
-  if (h.startsWith('/Users/')) {
-    // Other users' homes: under /Users but outside $HOME.
-    if (p.startsWith('/Users/') && p !== h && !p.startsWith(`${h}/`)) return true
-  } else if (p.startsWith('/Users/') || p === '/Users') {
-    return true
+  // Multi-user home roots, both layouts: every home tree except $HOME itself
+  // (and its descendants) is off-limits — other users' data is never junk.
+  for (const usersRoot of ['/Users', '/home']) {
+    if (h.startsWith(`${usersRoot}/`)) {
+      if (p.startsWith(`${usersRoot}/`) && !p.startsWith(`${h}/`)) return true
+    } else if (p === usersRoot || p.startsWith(`${usersRoot}/`)) {
+      return true
+    }
   }
+  // root's home is another user's home unless it IS $HOME.
+  if (h !== '/root' && (p === '/root' || p.startsWith('/root/'))) return true
   return false
 }
 
@@ -437,9 +618,12 @@ async function mapLimit<T, R>(items: readonly T[], limit: number, task: (item: T
   return results
 }
 
-function assertMacOS(): void {
-  if (platform() !== 'darwin') {
-    throw new PcManagerError('unsupported_platform', 'junk scan/clean only support macOS hosts.')
+/** Platforms the junk domain supports; everything else is refused whole. */
+const SUPPORTED_PLATFORMS: ReadonlySet<string> = new Set(['darwin', 'linux'])
+
+function assertSupportedPlatform(): void {
+  if (!SUPPORTED_PLATFORMS.has(platform())) {
+    throw new PcManagerError('unsupported_platform', 'junk scan/clean support macOS and Linux hosts.')
   }
 }
 
@@ -467,7 +651,7 @@ export async function scanJunk(
   options: ScanJunkOptions = {},
   targets: readonly JunkTarget[] = resolveTargets(),
 ): Promise<JunkScanReport> {
-  assertMacOS()
+  assertSupportedPlatform()
   throwIfAborted(options.signal, 'scan')
   const selected = options.kinds === undefined
     ? targets
@@ -686,24 +870,40 @@ export async function validateJunkIds(
   }
 }
 
-/** Absolute path of the system trash utility (macOS 15+); called without PATH lookup. */
+/** Absolute path of the macOS system trash utility (15+); called without PATH lookup. */
 export const TRASH_BIN = '/usr/bin/trash'
-/** Timeout for one trash(8) invocation. */
+
+/** Linux trash-put candidates (trash-cli), most preferred first. */
+export const LINUX_TRASH_BINS: readonly string[] = ['/usr/bin/trash-put', '/usr/local/bin/trash-put']
+
+/** GLib's trash helper (`gio trash <paths>`), the Linux tier-1 fallback. */
+const GIO_TRASH = { bin: '/usr/bin/gio', args: ['trash'] } as const
+
+/** Timeout for one tier-1 trash invocation. */
 const TRASH_TIMEOUT_MS = 30_000
+
+/** One resolved tier-1 trash command. */
+export interface TrashCommand {
+  bin: string
+  /** Leading argv before the path list (gio needs a `trash` subcommand). */
+  prefixArgs: readonly string[]
+}
 
 /** Injectable indirections so tests can exercise every trash tier offline. */
 export interface CleanIo {
-  /** Tier 1: hand paths to the system trash utility. */
+  /** Tier 1: hand paths to the platform's trash utility. */
   runTrashCommand(paths: readonly string[]): Promise<void>
   /** Tier 2 primitive; tests inject an EXDEV-throwing rename to reach tier 3. */
   rename(from: string, to: string): Promise<void>
 }
 
-/** Options for {@link cleanJunk}; `home` and `io` are test seams. */
+/** Options for {@link cleanJunk}; `home`, `platform` and `io` are test seams. */
 export interface CleanJunkOptions {
   signal?: AbortSignal
-  /** Overrides the home directory backing `~/.Trash` (default os.homedir()). */
+  /** Overrides the home directory backing the trash layout (default os.homedir()). */
   home?: string
+  /** Overrides the platform selecting the trash layout and tier-1 utility (default os.platform()). */
+  platform?: NodeJS.Platform
   /** Partial override of the fs/exec indirections. */
   io?: Partial<CleanIo>
 }
@@ -712,7 +912,9 @@ const runFile = promisify(execFile)
 
 const defaultIo: CleanIo = {
   runTrashCommand: async paths => {
-    await runFile(TRASH_BIN, [...paths], { timeout: TRASH_TIMEOUT_MS })
+    const command = await resolveTrashCommand()
+    if (command === null) throw new Error('no trash utility available on this platform')
+    await runFile(command.bin, [...command.prefixArgs, ...paths], { timeout: TRASH_TIMEOUT_MS })
   },
   rename: (from, to) => rename(from, to),
 }
@@ -726,62 +928,125 @@ async function canExecute(file: string): Promise<boolean> {
   }
 }
 
-/**
- * Reject a `~/.Trash` that is not a directory, not ours, or writable by
- * group/others — a world-writable trash destination would let anything
- * intercept "recovered" files.
- */
-async function ensureSafeTrashDir(trashDir: string): Promise<void> {
-  let stat: Stats
-  try {
-    stat = await lstat(trashDir)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-    await mkdir(trashDir, { mode: 0o700 })
-    return
+/** Resolve the platform's tier-1 trash utility by existence probe; null when absent. */
+export async function resolveTrashCommand(plat: NodeJS.Platform = platform()): Promise<TrashCommand | null> {
+  if (plat === 'darwin') {
+    return await canExecute(TRASH_BIN) ? { bin: TRASH_BIN, prefixArgs: [] } : null
   }
-  if (!stat.isDirectory()) throw new Error(`${trashDir} is not a directory`)
-  const uid = process.getuid?.()
-  if (uid === undefined || stat.uid !== uid) throw new Error(`${trashDir} is not owned by the current user`)
-  if ((stat.mode & 0o022) !== 0) throw new Error(`${trashDir} is group- or other-writable`)
-}
-
-/** First free `name`, `name 2`, `name 3`, … inside the trash directory. */
-async function reserveTrashName(trashDir: string, name: string): Promise<string> {
-  for (let attempt = 1; ; attempt += 1) {
-    const candidate = join(trashDir, attempt === 1 ? name : `${name} ${attempt}`)
-    try {
-      await lstat(candidate)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return candidate
-      throw error
+  if (plat === 'linux') {
+    for (const bin of LINUX_TRASH_BINS) {
+      if (await canExecute(bin)) return { bin, prefixArgs: [] }
     }
+    return await canExecute(GIO_TRASH.bin) ? { bin: GIO_TRASH.bin, prefixArgs: GIO_TRASH.args } : null
+  }
+  return null
+}
+
+/** The trash directory faces of one platform: macOS keeps a flat `~/.Trash`;
+ * Linux follows the freedesktop spec with `files/` and `info/` subdirs. */
+export interface TrashDirs {
+  root: string
+  /** Where trashed items live (equals `root` on macOS). */
+  files: string
+  /** Restore-record directory; null on macOS (no Put Back metadata exists there). */
+  info: string | null
+}
+
+/** The trash layout for `home` under `plat`; exported for tests. */
+export function trashDirs(plat: NodeJS.Platform, home: string): TrashDirs {
+  if (plat === 'linux') {
+    const root = join(home, '.local/share/Trash')
+    return { root, files: join(root, 'files'), info: join(root, 'info') }
+  }
+  const root = join(home, '.Trash')
+  return { root, files: root, info: null }
+}
+
+/**
+ * Reject a trash-directory face that is not a directory, not ours, or
+ * writable by group/others — a world-writable trash destination would let
+ * anything intercept "recovered" files. Missing faces are created 0700.
+ */
+async function ensureSafeTrashDirs(dirs: TrashDirs): Promise<void> {
+  for (const dir of [dirs.root, dirs.files, dirs.info]) {
+    if (dir === null) continue
+    let stat: Stats
+    try {
+      stat = await lstat(dir)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      await mkdir(dir, { recursive: true, mode: 0o700 })
+      continue
+    }
+    if (!stat.isDirectory()) throw new Error(`${dir} is not a directory`)
+    const uid = process.getuid?.()
+    if (uid === undefined || stat.uid !== uid) throw new Error(`${dir} is not owned by the current user`)
+    if ((stat.mode & 0o022) !== 0) throw new Error(`${dir} is group- or other-writable`)
   }
 }
 
-async function moveToTrash(path: string, home: string, io: CleanIo, trashBinUsable: boolean): Promise<void> {
-  if (trashBinUsable) {
+/** First free `name`, `name 2`, `name 3`, … — free in BOTH the files face and
+ * the info face, so a leftover `.trashinfo` never orphans a fresh entry. */
+async function reserveTrashName(dirs: TrashDirs, name: string): Promise<string> {
+  for (let attempt = 1; ; attempt += 1) {
+    const candidate = attempt === 1 ? name : `${name} ${attempt}`
+    const taken = await Promise.all([
+      lstat(join(dirs.files, candidate)).then(() => true, error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+        throw error
+      }),
+      dirs.info === null
+        ? Promise.resolve(false)
+        : lstat(join(dirs.info, `${candidate}.trashinfo`)).then(() => true, error => {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+            throw error
+          }),
+    ])
+    if (!taken.some(Boolean)) return candidate
+  }
+}
+
+/**
+ * The freedesktop restore record for one trashed item (`info/<name>.trashinfo`).
+ * Without it desktop trash UIs still list the item but cannot offer Put Back —
+ * writing it makes tier-2 recovery path-aware.
+ */
+async function writeTrashInfo(infoDir: string, name: string, originalPath: string): Promise<void> {
+  const deletionDate = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const content = `[Trash Info]\nPath=${encodeURI(originalPath)}\nDeletionDate=${deletionDate}\n`
+  await writeFile(join(infoDir, `${name}.trashinfo`), content, { mode: 0o600 })
+}
+
+async function moveToTrash(path: string, home: string, io: CleanIo, tier1Usable: boolean, plat: NodeJS.Platform): Promise<void> {
+  if (tier1Usable) {
     try {
       await io.runTrashCommand([path])
       return
     } catch (error) {
-      console.warn(`[pc-manager] ${TRASH_BIN} failed, falling back to rename: ${String(error)}`)
+      console.warn(`[pc-manager] trash utility failed, falling back to rename: ${String(error)}`)
     }
   }
-  const trashDir = join(home, '.Trash')
-  await ensureSafeTrashDir(trashDir)
-  const dest = await reserveTrashName(trashDir, basename(path))
+  const dirs = trashDirs(plat, home)
+  await ensureSafeTrashDirs(dirs)
+  const name = await reserveTrashName(dirs, basename(path))
+  const dest = join(dirs.files, name)
   try {
     await io.rename(path, dest)
-    return
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error
+    // Cross-volume last resort: copy in, verify the copy landed, then remove
+    // the source. A failure before the rm leaves the source untouched.
+    await cp(path, dest, { recursive: true, force: false })
+    await lstat(dest)
+    await rm(path, { recursive: true, force: false })
   }
-  // Cross-volume last resort: copy in, verify the copy landed, then remove
-  // the source. A failure before the rm leaves the source untouched.
-  await cp(path, dest, { recursive: true, force: false })
-  await lstat(dest)
-  await rm(path, { recursive: true, force: false })
+  // The restore record is best-effort metadata: a failure here must not undo
+  // a completed move, only cost the Put Back affordance.
+  if (dirs.info !== null) {
+    await writeTrashInfo(dirs.info, name, path).catch(error => {
+      console.warn(`[pc-manager] trashinfo write failed for ${path}: ${String(error)}`)
+    })
+  }
 }
 
 /** Remove every child of `dir`, keeping the directory itself. */
@@ -791,14 +1056,24 @@ async function emptyDirectory(dir: string): Promise<void> {
   }
 }
 
+/** Empty the trash kind in place (moving entries of the trash back into the
+ * trash would be a no-op): macOS clears the flat root, Linux clears the
+ * contents of `files/` and `info/` while keeping the layout directories. */
+async function emptyTrash(dirs: TrashDirs): Promise<void> {
+  await emptyDirectory(dirs.files)
+  if (dirs.info !== null) await emptyDirectory(dirs.info)
+}
+
 /**
  * Reclaim the selected junk items. All ids pass the structural validation
  * chain first — one invalid id rejects the whole batch with zero deletions.
  * Per item: vanished targets report `not_found`; re-measure failure skips the
- * item untouched; trash mode tiers through /usr/bin/trash, rename into
- * ~/.Trash, and cross-volume copy+remove. The `trash` kind empties its
- * children in place (moving entries of the Trash back into the Trash would be
- * a no-op). Failures surface per-item, never silently.
+ * item untouched; trash mode tiers through the platform's trash utility
+ * (macOS /usr/bin/trash; Linux trash-put/gio trash), rename into the trash
+ * layout (~/.Trash or ~/.local/share/Trash with a .trashinfo restore record),
+ * and cross-volume copy+remove. The `trash` kind empties the layout in place
+ * (moving entries of the trash back into the trash would be a no-op).
+ * Failures surface per-item, never silently.
  */
 export async function cleanJunk(
   ids: readonly string[],
@@ -806,16 +1081,18 @@ export async function cleanJunk(
   targets: readonly JunkTarget[] = resolveTargets(),
   options: CleanJunkOptions = {},
 ): Promise<JunkCleanResult> {
-  assertMacOS()
+  assertSupportedPlatform()
   if (ids.length === 0) {
     throw new PcManagerError('invalid_argument', 'cleanJunk requires at least one junk item id.')
   }
   const home = options.home ?? homedir()
+  const plat = options.platform ?? platform()
   const io: CleanIo = { ...defaultIo, ...options.io }
   const expanded = await expandGlobs(targets)
   await validateJunkIds(ids, expanded, home)
 
-  const trashBinUsable = mode === 'trash' && (options.io?.runTrashCommand !== undefined || await canExecute(TRASH_BIN))
+  const tier1Usable = mode === 'trash'
+    && (options.io?.runTrashCommand !== undefined || (await resolveTrashCommand(plat)) !== null)
   const outcomes: JunkCleanOutcome[] = []
   for (const id of ids) {
     throwIfAborted(options.signal, 'clean')
@@ -847,13 +1124,16 @@ export async function cleanJunk(
     }
     try {
       if (kind === 'trash') {
-        // Emptying the Trash is the destructive act itself; its contents have
-        // no further trash to go to. The directory itself stays in place.
-        await emptyDirectory(path)
+        // Emptying the trash is the destructive act itself; its contents have
+        // no further trash to go to. The item path IS the registry's trash
+        // root (whole granularity), so the layout derives from it directly.
+        await emptyTrash(plat === 'linux'
+          ? { root: path, files: join(path, 'files'), info: join(path, 'info') }
+          : { root: path, files: path, info: null })
       } else if (mode === 'delete') {
         await rm(path, { recursive: true, force: false })
       } else {
-        await moveToTrash(path, home, io, trashBinUsable)
+        await moveToTrash(path, home, io, tier1Usable, plat)
       }
       outcomes.push({ id, reclaimedBytes: bytes })
     } catch (error) {

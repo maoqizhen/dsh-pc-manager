@@ -8,12 +8,14 @@
 
 import { describe, expect, it } from 'vitest'
 import {
-  cpuUsagePercent, diffNetRates, diffProcessRates, mergeProcesses, parseDf, parseIoregBattery, parseIoregGpu, parseIostat,
-  parseNetstatIb, parseNettop, parsePs, parsePmsetBatt, parseSwapUsage, parseVmStat, sortByNetworkRate, sortProcesses,
-  unionProcessRows,
+  cpuUsagePercent, diffNetRates, diffProcessRates, diskstatRate, mergeProcesses, parseBatteryUevent, parseDf,
+  parseDiskstats, parseIoregBattery, parseIoregGpu, parseIostat, parseMeminfo, parseNetstatIb, parseNettop,
+  parseNvidiaSmiGpu, parseOsRelease, parseProcNetDev, parsePs, parsePmsetBatt, parseSwapUsage, parseVmStat,
+  sortByNetworkRate, sortProcesses, unionProcessRows,
 } from '../src/monitor.ts'
-import type { ProcessRateState } from '../src/monitor.ts'
-import { resolveTargets } from '../src/junk.ts'
+import type { DiskstatSample, ProcessRateState } from '../src/monitor.ts'
+import { JUNK_TARGETS, JUNK_TARGETS_DARWIN, JUNK_TARGETS_LINUX, resolveTargets } from '../src/junk.ts'
+import { platform } from 'node:os'
 import type { CpuInfo } from 'node:os'
 import type { ProcessInfo } from '../src/types.ts'
 
@@ -409,10 +411,192 @@ describe('mergeProcesses + sortProcesses', () => {  const rows: readonly Process
 })
 
 describe('resolveTargets', () => {
-  it('expands ~ against the given home and preserves registry size', () => {
-    const targets = resolveTargets(undefined, '/Users/tester')
-    expect(targets).toHaveLength(19)
-    expect(targets[0].dir).toBe('/Users/tester/.Trash')
-    expect(targets[1].dir).toBe('/Users/tester/Library/Caches')
+  it('expands ~ against the given home and preserves registry size, per platform', () => {
+    const darwin = resolveTargets(JUNK_TARGETS_DARWIN, '/Users/tester')
+    expect(darwin).toHaveLength(19)
+    expect(darwin[0].dir).toBe('/Users/tester/.Trash')
+    expect(darwin[1].dir).toBe('/Users/tester/Library/Caches')
+    const linux = resolveTargets(JUNK_TARGETS_LINUX, '/home/tester')
+    expect(linux).toHaveLength(12)
+    expect(linux[0].dir).toBe('/home/tester/.local/share/Trash')
+    expect(linux[1].dir).toBe('/home/tester/.cache')
+    expect(linux[2].dir).toBe('/tmp')
+    expect(linux[3].dir).toBe('/var/tmp')
+  })
+
+  it('dispatches JUNK_TARGETS by the runtime platform', () => {
+    expect(JUNK_TARGETS).toBe(platform() === 'linux' ? JUNK_TARGETS_LINUX : JUNK_TARGETS_DARWIN)
+  })
+})
+
+const LINUX_DF_SAMPLE = `Filesystem     1K-blocks     Used Available Use% Mounted on
+udev             8179100        0   8179100   0% /dev
+tmpfs            1638076      576   1637500   1% /run
+/dev/vda1       41111748 22561324  16842000  58% /
+tmpfs            8190380        0   8190380   0% /dev/shm
+tmpfs               5120        0      5120   0% /run/lock
+/dev/vda15        126678    11840    114838  10% /boot/efi
+tmpfs            1638076        0   1638076   0% /run/user/0
+overlay          41111748 22561324  16842000  58% /var/lib/docker/overlay2/abc/merged
+squashfs         1638076        0   1638076   0% /snap/core22/1380
+/dev/vdb1       41111748 22561324  16842000  58% /data
+`
+
+describe('parseDf (Linux)', () => {
+  it('drops pseudo filesystems and kernel mount points, keeping real volumes', () => {
+    const disks = parseDf(LINUX_DF_SAMPLE)
+    expect(disks.map(disk => disk.mount)).toEqual(['/', '/boot/efi', '/data'])
+    expect(disks[0]).toMatchObject({ filesystem: '/dev/vda1', totalBytes: 41111748 * 1024, usedBytes: 22561324 * 1024 })
+  })
+
+  it('keeps an overlay root (a container only has its overlay as the real disk)', () => {
+    const disks = parseDf('Filesystem 1K-blocks Used Available Use% Mounted on\noverlay 1000 100 900 10% /')
+    expect(disks.map(disk => disk.mount)).toEqual(['/'])
+  })
+})
+
+const MEMINFO_SAMPLE = `MemTotal:       16380760 kB
+MemFree:         1985520 kB
+MemAvailable:   12501468 kB
+Buffers:          583908 kB
+Cached:          9104364 kB
+SwapCached:            0 kB
+Active:          5722156 kB
+Inactive:        7195180 kB
+AnonPages:       3175784 kB
+Shmem:              2320 kB
+Slab:            1322960 kB
+SReclaimable:    1167480 kB
+SUnreclaim:       155480 kB
+SwapTotal:             0 kB
+SwapFree:              0 kB
+`
+
+describe('parseMeminfo', () => {
+  it('scales kB lines and derives used from MemAvailable', () => {
+    const usage = parseMeminfo(MEMINFO_SAMPLE)
+    expect(usage).not.toBeNull()
+    expect(usage?.totalBytes).toBe(16380760 * 1024)
+    expect(usage?.usedBytes).toBe((16380760 - 12501468) * 1024)
+    expect(usage?.cachedBytes).toBe((583908 + 9104364 + 1167480) * 1024)
+    expect(usage?.anonPagesBytes).toBe(3175784 * 1024)
+    expect(usage?.sUnreclaimBytes).toBe(155480 * 1024)
+    expect(usage?.swapTotalBytes).toBe(0)
+  })
+
+  it('falls back to total−free−buffers−cached without MemAvailable', () => {
+    const usage = parseMeminfo('MemTotal: 1000 kB\nMemFree: 300 kB\nBuffers: 100 kB\nCached: 200 kB\n')
+    expect(usage?.usedBytes).toBe(400 * 1024)
+  })
+
+  it('returns null without the MemTotal/MemFree anchors', () => {
+    expect(parseMeminfo('Slab: 1 kB')).toBeNull()
+  })
+})
+
+describe('parseOsRelease', () => {
+  it('prefers PRETTY_NAME and strips quotes', () => {
+    expect(parseOsRelease('NAME="Debian GNU/Linux"\nVERSION_ID="12"\nPRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n'))
+      .toBe('Debian GNU/Linux 12 (bookworm)')
+  })
+
+  it('falls back to NAME + VERSION_ID, and null without a name', () => {
+    expect(parseOsRelease('NAME="Alpine Linux"\nVERSION_ID=3.20\n')).toBe('Alpine Linux 3.20')
+    expect(parseOsRelease('VERSION_ID=1\n')).toBeNull()
+    expect(parseOsRelease('')).toBeNull()
+  })
+})
+
+const NETDEV_SAMPLE = `Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 1494865852  911349    0    0    0     0          0         0 1494865852  911349    0    0    0     0       0          0
+  eth0: 42086214556 60039480    0    1    0     0          0         0 12114914053 39678794    0    0    0     0       0          0
+  eth1:   80392    1762    0    0    0     0          0         0   324826    4950    0    0    0     0       0          0
+`
+
+describe('parseProcNetDev', () => {
+  it('parses per-interface counters, dropping loopback', () => {
+    expect(parseProcNetDev(NETDEV_SAMPLE)).toEqual([
+      { interface: 'eth0', rxBytes: 42086214556, txBytes: 12114914053 },
+      { interface: 'eth1', rxBytes: 80392, txBytes: 324826 },
+    ])
+  })
+
+  it('returns empty on header-only or malformed input', () => {
+    expect(parseProcNetDev('Inter-|   Receive |  Transmit\n face |bytes |bytes\n')).toEqual([])
+    expect(parseProcNetDev('')).toEqual([])
+  })
+})
+
+const DISKSTATS_SAMPLE = `   7       0 loop0 0 0 0 0 0 0 0 0 0 0 0
+ 254       0 vda 388342 9118 14648241 468864 38073381 28779780 682659067 12461280 0 1818244 13230268
+ 254       1 vda1 385498 9118 14522849 468059 38073338 28779772 682658962 12461272 0 1968696 12929331
+   8        0 sda 100 0 200 10 100 0 400 20 0 30 60
+ 259       0 nvme0n1 5 0 10 1 5 0 10 1 0 2 3
+`
+
+describe('parseDiskstats + diskstatRate', () => {
+  it('sums read+write sectors over physical whole disks only', () => {
+    const sample = parseDiskstats(DISKSTATS_SAMPLE, 1_000)
+    // vda 14648241+682659067, sda 200+400, nvme0n1 10+10; vda1 (partition) and loop0 excluded.
+    expect(sample).toEqual({ at: 1_000, sectors: 14648241 + 682659067 + 200 + 400 + 10 + 10 })
+  })
+
+  it('yields bytes/sec over the sample window and guards resets', () => {
+    expect(diskstatRate({ at: 0, sectors: 100 }, { at: 1_000, sectors: 300 })).toBe(200 * 512)
+    expect(diskstatRate({ at: 1_000, sectors: 100 }, { at: 1_000, sectors: 300 })).toBeNull()
+    expect(diskstatRate({ at: 0, sectors: 300 }, { at: 1_000, sectors: 100 })).toBeNull()
+  })
+})
+
+describe('parseNvidiaSmiGpu', () => {
+  it('takes the busiest numeric line', () => {
+    expect(parseNvidiaSmiGpu('17\n52\n')).toBe(52)
+    expect(parseNvidiaSmiGpu(' 0 ')).toBe(0)
+  })
+
+  it('returns null on unsupported or empty output', () => {
+    expect(parseNvidiaSmiGpu('[Not Supported]\n')).toBeNull()
+    expect(parseNvidiaSmiGpu('')).toBeNull()
+  })
+})
+
+const UEVENT_SAMPLE = `POWER_SUPPLY_NAME=BAT0
+POWER_SUPPLY_TYPE=Battery
+POWER_SUPPLY_STATUS=Discharging
+POWER_SUPPLY_PRESENT=1
+POWER_SUPPLY_CAPACITY=92
+POWER_SUPPLY_CYCLE_COUNT=213
+POWER_SUPPLY_ENERGY_FULL=4600000
+POWER_SUPPLY_ENERGY_FULL_DESIGN=5000000
+POWER_SUPPLY_TIME_TO_EMPTY_NOW=192
+`
+
+describe('parseBatteryUevent', () => {
+  it('derives the full battery face from uevent fields', () => {
+    expect(parseBatteryUevent(UEVENT_SAMPLE, null)).toEqual({
+      percent: 92,
+      charging: false,
+      powerSource: 'Battery Power',
+      timeRemainingMinutes: 192,
+      cycleCount: 213,
+      healthPercent: 92,
+    })
+  })
+
+  it('pins the power source from the adapter online file when available', () => {
+    expect(parseBatteryUevent(UEVENT_SAMPLE, true)?.powerSource).toBe('AC Power')
+    expect(parseBatteryUevent(UEVENT_SAMPLE, false)?.powerSource).toBe('Battery Power')
+  })
+
+  it('nulls out on non-battery or absent nodes', () => {
+    expect(parseBatteryUevent('POWER_SUPPLY_TYPE=Mains\nPOWER_SUPPLY_ONLINE=1\n', null)).toBeNull()
+    expect(parseBatteryUevent('POWER_SUPPLY_TYPE=Battery\nPOWER_SUPPLY_PRESENT=0\n', null)).toBeNull()
+  })
+
+  it('derives percent from charge ratios when CAPACITY is absent', () => {
+    const sample = UEVENT_SAMPLE.replace('POWER_SUPPLY_CAPACITY=92\n', '')
+      .replace('POWER_SUPPLY_ENERGY_FULL=', 'POWER_SUPPLY_ENERGY_NOW=4370000\nPOWER_SUPPLY_ENERGY_FULL=')
+    expect(parseBatteryUevent(sample, null)?.percent).toBe(95)
   })
 })

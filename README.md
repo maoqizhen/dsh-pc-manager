@@ -5,6 +5,9 @@
 DeepSeek Harness (dsh) 的电脑管家插件（官方 bundle 格式），提供：系统状态监控（模型工具 +
 右侧边栏仪表盘）、系统垃圾清理（零 LLM 直执行窗口）、软件卸载（M3），共 5 个模型可见工具。
 
+**平台支持**：监控（`pc_status` + 仪表盘）与垃圾清理（`pc_junk_scan`/`pc_junk_clean` + 清理窗口）
+在 **macOS 与 Linux** 上工作；其余平台返回 `unsupported_platform`。
+
 定位是**安全第一**的 agent 系统工具：扫描永远 dry-run；破坏性工具默认 `disabled_by_config`，
 宿主显式开启才动手；回收/卸载默认进废纸篓（可恢复）；id 校验链任一失败**整体拒绝零删除**。
 
@@ -59,30 +62,54 @@ ln -s "$PWD" ~/.dsh/profiles/web/node_modules/dsh-pc-manager
 
 | 工具 | 功能 | 状态 |
 | --- | --- | --- |
-| `pc_status` | 只读系统快照：CPU/GPU 使用率、负载、内存分解（含 swap）、磁盘 I/O 与各卷占用、电池/电源、网络计数器、多键排序进程表 | ✅ 已实装 |
-| `pc_junk_scan` | 枚举可回收垃圾（废纸篓、用户缓存/日志、系统临时、Xcode 产物、模拟器残留、18 类包管理器缓存、iOS 备份），逐项体积/安全标记/保护排除记录；参数 `kinds` / `minItemBytes`；永远 dry-run | ✅ 已实装 |
-| `pc_junk_clean` | 按 scan 返回的精确 id 回收；结构校验链（格式/根包含/realpath/blocked/safeToClean）任一失败整体拒绝零删除；`trash` kind 原地清空、其余默认三级 trash（`/usr/bin/trash` → rename `~/.Trash` → 跨卷 cp+rm）；量不准不删；需配置显式开启 | ✅ 已实装 |
+| `pc_status` | 只读系统快照：CPU/GPU 使用率、负载、内存分解（含 swap）、磁盘 I/O 与各卷占用、电池/电源、网络计数器、多键排序进程表（macOS + Linux） | ✅ 已实装 |
+| `pc_junk_scan` | 枚举可回收垃圾（macOS：废纸篓、用户缓存/日志、系统临时、Xcode 产物、模拟器残留、包管理器缓存、iOS 备份；Linux：XDG 回收站、~/.cache、/tmp 与 /var/tmp、包管理器缓存），逐项体积/安全标记/保护排除记录；参数 `kinds` / `minItemBytes`；永远 dry-run | ✅ 已实装 |
+| `pc_junk_clean` | 按 scan 返回的精确 id 回收；结构校验链（格式/根包含/realpath/blocked/safeToClean）任一失败整体拒绝零删除；`trash` kind 原地清空、其余默认三级 trash（macOS：`/usr/bin/trash` → rename `~/.Trash` → 跨卷 cp+rm；Linux：`trash-put`/`gio trash` → freedesktop `~/.local/share/Trash/{files,info}` 带 `.trashinfo` 还原记录 → 跨卷 cp+rm）；量不准不删；需配置显式开启 | ✅ 已实装 |
 | `pc_apps_list` | 已装应用清单（app bundle + Homebrew），含大小/最近使用 | 桩，M3 |
 | `pc_app_uninstall` | 按精确 id 卸载；默认移入废纸篓，残留项报告而非静默删除 | 桩，M3 |
 
+### 垃圾目标注册表（按平台分派）
+
+注册表结构跨平台共享（`JunkTarget`），条目按平台分派：`JUNK_TARGETS_DARWIN`（18 类 / 19 行）与
+`JUNK_TARGETS_LINUX`（11 类 / 12 行，XDG 布局）；`JUNK_KINDS` 封闭词表跨平台不变（schema 稳定），
+macOS 专属类（user-logs、Xcode/模拟器族、ios-backups）在 Linux 侧无条目。
+
+| Linux 类别 | 目录 | 粒度 | minAge | safe |
+| --- | --- | --- | --- | --- |
+| `trash` | `~/.local/share/Trash` | whole | — | ✅ |
+| `user-caches` | `~/.cache`（含 thumbnails） | children（`LINUX_PROTECTED_CHILDREN` 保护） | — | ✅ |
+| `system-temp` ×2 | `/tmp`、`/var/tmp` | children（`systemd-private-*`、`snap-private-tmp`、Linux EDR 前缀保护） | 3 天 | ✅ |
+| `npm-cache` / `pnpm-store` / `homebrew-cache` | `~/.npm/_cacache` / `~/.local/share/pnpm/store`（❌ 建议 `pnpm store prune`）/ `~/.cache/Homebrew` | whole / children / children | — | ✅ / ❌ / ✅ |
+| `pip-cache` / `uv-cache` / `yarn-cache` / `go-build-cache` / `go-mod-cache` | `~/.cache/{pip,uv,yarn,go-build}`、`~/go/pkg/mod/cache` | whole | — | ✅ |
+
+**命令式回收不进注册表**（延续设计文档 §14）：`apt-get autoremove --purge`（先 `-s` 模拟）、
+`journalctl --vacuum-size=`、snap 旧版本（`snap list --all` 的 disabled 行 → `snap remove
+--revision`）、`flatpak uninstall --unused`、`docker system prune` 只作为建议命令报告，不做执行路径。
+
+**blocked 红线清单**（两平台并集，防未来注册表误配）：macOS 侧 `/System`、`/usr`、`/private/var/db`、
+`~/Library/Containers` 等原样保留；Linux 侧 `/etc`、`/boot`、`/var/log`、`/var/lib`（含 dpkg/snapd/
+flatpak 状态）、`/var/cache`、`/lib*`（含运行中内核模块）、`/srv`；多用户 home 双布局
+（`/Users` 与 `/home`）下他人目录一律拒绝，`/root` 在非 $HOME 时同样拒绝。
+
 ## 系统监控指标与数据来源
 
-所有探针失败降级为 null/空值 + `console.warn`，不炸快照（温度需 sudo、进程级 GPU/磁盘需特权 helper，均明确不做）。
+所有探针按平台分派、失败降级为 null/空值 + `console.warn`，不炸快照（温度需特权、进程级
+GPU/磁盘需特权 helper，均明确不做）。Linux 侧全部读 `/proc` 与 `/sys`，零依赖零提权。
 
-| 分组 | 指标 | 来源 | 解析器 |
-| --- | --- | --- | --- |
-| CPU | 使用率 % | `os.cpus()` 两次采样 250ms 差分 | `cpuUsagePercent` |
-| CPU | 型号/核数/负载 1/5/15 | `node:os` | — |
-| GPU | 使用率 %（尽力而为） | `ioreg -r -d 1 -c IOAccelerator` 的 `Device Utilization %`，多 GPU 取最大 | `parseIoregGpu` |
-| 内存 | used = active+wired+compressed（回退 total−free）；app/wired/compressed/cached/purgeable | `vm_stat`（页大小从头部解析） | `parseVmStat` |
-| 内存 | swap 总量/已用 | `sysctl -n vm.swapusage` | `parseSwapUsage` |
-| 磁盘 | 各卷占用 | `df -k` | `parseDf` |
-| 磁盘 | I/O 吞吐（读+写合计，无 sudo 拆不开） | `iostat -d -c 2` 末样本求和 | `parseIostat` |
-| 电池 | 电量/充电/剩余时间/循环/健康度 | `pmset -g batt` + `ioreg -rn AppleSmartBattery` | `parsePmsetBatt` / `parseIoregBattery` |
-| 网络 | 各接口累计 rx/tx（速率由调用方差分） | `netstat -ib`（排除 lo*，`<Link#>` 行去重） | `parseNetstatIb` |
-| 进程网络 | **仪表盘/SSE 帧：实时速率**（服务端按 pid 记忆窗口差分，`processRates`）；**`pc_status` 工具：累计值**（单次调用无上下文，累计是唯一诚实口径）——两口径各自成立 | `nettop` 累计 + pump 差分 | `parseNettop` / `diffProcessRates` |
-| 系统 | macOS 版本 | `sw_vers -productVersion` | `parseSwVers` |
-| 进程 | CPU%/内存%(+rss)/网络累计；GPU/磁盘列预留恒 null | `ps -Ao pid,pcpu,pmem,rss,comm` + `nettop -P -L 1 -n -J bytes_in,bytes_out`（CSV/JSON 双兼容） | `parsePs` / `parseNettop` / `mergeProcesses` / `sortProcesses` |
+| 分组 | 指标 | macOS 来源 | Linux 来源 | 解析器 |
+| --- | --- | --- | --- | --- |
+| CPU | 使用率 % | `os.cpus()` 两次采样 250ms 差分 | 同左（采样窗口 ≥1s，见磁盘 I/O） | `cpuUsagePercent` |
+| CPU | 型号/核数/负载 1/5/15 | `node:os` | `node:os` | — |
+| GPU | 使用率 %（尽力而为） | `ioreg -r -d 1 -c IOAccelerator` 的 `Device Utilization %`，多 GPU 取最大 | `nvidia-smi --query-gpu=utilization.gpu`（无 NVIDIA 硬件则 null，UI 整卡隐藏） | `parseIoregGpu` / `parseNvidiaSmiGpu` |
+| 内存 | macOS: used = active+wired+compressed（回退 total−free）；Linux: used = MemTotal−MemAvailable（回退 total−free−buffers−cached） | `vm_stat`（页大小从头部解析） | `/proc/meminfo`（app≈AnonPages，wired≈SUnreclaim，cached=Buffers+Cached+SReclaimable） | `parseVmStat` / `parseMeminfo` |
+| 内存 | swap 总量/已用 | `sysctl -n vm.swapusage` | `/proc/meminfo` 的 SwapTotal/SwapFree | `parseSwapUsage` / `parseMeminfo` |
+| 磁盘 | 各卷占用 | `df -k` | `df -k`（解析兼容两种列布局；过滤 tmpfs/udev/overlay/squashfs 等伪文件系统与 /dev /proc /sys /run /snap 挂载点） | `parseDf` |
+| 磁盘 | I/O 吞吐（读+写合计） | `iostat -d -c 2` 末样本求和 | `/proc/diskstats` 双采样差分（物理整盘 sd/nvme/vd/hd/mmcblk，排除分区与 loop/dm；采样窗口拉到 1s） | `parseIostat` / `parseDiskstats` + `diskstatRate` |
+| 电池 | 电量/充电/剩余时间/循环/健康度 | `pmset -g batt` + `ioreg -rn AppleSmartBattery` | `/sys/class/power_supply/BAT*/uevent`（AC 从 `A*/online`；无电池隐藏卡片） | `parsePmsetBatt` / `parseIoregBattery` / `parseBatteryUevent` |
+| 网络 | 各接口累计 rx/tx（速率由调用方差分） | `netstat -ib`（排除 lo*，`<Link#>` 行去重） | `/proc/net/dev`（排除 lo） | `parseNetstatIb` / `parseProcNetDev` |
+| 进程网络 | **仪表盘/SSE 帧：实时速率**；**`pc_status` 工具：累计值**——两口径各自成立 | `nettop` 累计 + pump 差分 | 无免提权来源 → 进程网络列恒 null（UI 隐藏该列） | `parseNettop` / `diffProcessRates` |
+| 系统 | 系统版本 | `sw_vers -productVersion` | `/etc/os-release` PRETTY_NAME（如 `Debian GNU/Linux 12 (bookworm)`） | `parseSwVers` / `parseOsRelease` |
+| 进程 | CPU%/内存%(+rss)/网络累计；GPU/磁盘列预留恒 null | `ps -Ao pid,pcpu,pmem,rss,comm` + `nettop`（CSV/JSON 双兼容） | `ps -Ao pid,pcpu,pmem,rss,args`（Linux comm 截断 15 字符，改用 args） | `parsePs` / `parseNettop` / `mergeProcesses` / `sortProcesses` |
 
 ## 仪表盘（右侧边栏）
 
@@ -120,15 +147,18 @@ danger-full-access（`approval: never`）时会话内 ask 被静默自动拒绝�
 - **只读工具开箱即用**；两个破坏性工具默认 `disabled_by_config`，宿主在后层 patch 把开关置
   true 才会真正动手。
 - 回收/卸载默认走**废纸篓**（可恢复）；永久删除需 `moveToTrash: false`。trash 落地三级：
-  `/usr/bin/trash`（绝对路径调用，防 PATH 劫持）→ 归属校验后的 `~/.Trash` rename（名冲突加
-  ` 2`/` 3` 后缀）→ 跨卷 EXDEV 时 cp+rm；`trash` kind 本身原地清空（搬回废纸篓是无意义的套娃）。
+  macOS 为 `/usr/bin/trash`（绝对路径调用，防 PATH 劫持）→ 归属校验后的 `~/.Trash` rename（名冲突加
+  ` 2`/` 3` 后缀）→ 跨卷 EXDEV 时 cp+rm；Linux 为 `trash-put`/`gio trash`（探测式绝对路径）→
+  freedesktop `~/.local/share/Trash/{files,info}` rename + **`.trashinfo` 还原记录**（双面名冲突
+  同步后缀）→ 跨卷 cp+rm；`trash` kind 本身原地清空（搬回废纸篓是无意义的套娃）。
 - **垃圾清理三层确认**：模型对话确认（工具 description 指引优先 `ask_user_question`）+ 框架
   `tools/pre-execute` 审批闸门（`askBeforeJunkClean` 默认 true，每次必问、无 answerer
   fail-closed）+ id 结构校验链（children 类严格子路径 / whole 类恰为根、双侧 realpath 防符号
   链接重定向、blocked 清单、safeToClean；任一失败**整体拒绝零删除**）。
-- **安全目标注册表**是核心资产：18 类 / 19 行根，含敏感缓存保护清单（密码管理器/IDE/输入法/
-  VPN/同步盘/AI 应用的"缓存"实为不可再生状态，命中记入 `skipped` 不出 item）与 EDR 前缀保护
-  （企业安全代理缓存删除会触发防篡改告警）；`safeToClean:false` 条目只报告不清理，rationale 带
+- **安全目标注册表**是核心资产：macOS 18 类 / 19 行、Linux 11 类 / 12 行（XDG），含敏感缓存保护
+  清单（密码管理器/IDE/输入法/VPN/同步盘/AI 应用的"缓存"实为不可再生状态，命中记入 `skipped`
+  不出 item）与 EDR/活跃服务前缀保护（企业安全代理缓存删除会触发防篡改告警；Linux 侧另护
+  `systemd-private-*`、`snap-private-tmp`）；`safeToClean:false` 条目只报告不清理，rationale 带
   建议命令（`xcrun simctl delete unavailable` / `pnpm store prune`）。
 - 领域模块（`src/monitor.ts`、`junk.ts`、`apps.ts`）不依赖 cordis，纯逻辑可独立单测。
 
@@ -141,8 +171,8 @@ dual-face 包：host 半（工具 + 路由）与浏览器半都吃**已提交的
 ```
 ├── src/
 │   ├── index.ts       插件入口：Config（TS 接口 + Schemastery schema）+ apply；host 半含 webServer 路由
-│   ├── monitor.ts     系统探针与纯解析器（不依赖 cordis，可独立单测）
-│   ├── junk.ts        垃圾域：18 类安全注册表、保护/封锁清单、走查、id 校验链、trash 三级
+│   ├── monitor.ts     系统探针与纯解析器（macOS 子命令 + Linux /proc /sys；不依赖 cordis，可独立单测）
+│   ├── junk.ts        垃圾域：双平台安全注册表（darwin/linux）、保护/封锁清单、走查、id 校验链、trash 三级
 │   ├── apps.ts        应用域（M3 桩）
 │   ├── types.ts       领域契约、PcManagerError、封闭错误词表 PcErrorCode
 │   ├── tools.ts       唯一接触 defineTool 的注册层：guarded() 异常→封闭错误联合
@@ -179,12 +209,15 @@ pnpm dsh --patch ../dsh-pc-manager/cordis.patch.yml --profile web
 测试与类型检查：
 
 ```sh
-npm test                         # vitest（81 specs）+ tsc --noEmit，均借 harness 二进制
+npm test                         # vitest（111 specs，root 环境自动跳过 4 个 EACCES 用例）+ tsc --noEmit，均借 harness 二进制
 ```
 
-覆盖全部纯解析器（df/ps/vm_stat/swapusage/pmset/ioreg 电池与 GPU/iostat/netstat/nettop CSV+JSON/
-进程合并排序/CPU 差分）与垃圾域全套（注册表与保护清单逐条 pin、glob 展开、走查统计、scan 语义、
-校验链逐层含符号链接重定向、整体拒绝、trash 三级、量不准不删、审批摘要 en/zh 快照）。
+覆盖全部纯解析器（df 双平台含 Linux 伪文件系统过滤/ps/vm_stat/meminfo/swapusage/os-release/
+pmset/ioreg 电池与 GPU/nvidia-smi/iostat/diskstats 速率差分/netstat/net-dev/nettop CSV+JSON/
+power_supply uevent/进程合并排序/CPU 差分）与垃圾域全套（双平台注册表与保护清单逐条 pin、
+glob 展开、走查统计、scan 语义、校验链逐层含符号链接重定向、整体拒绝、双平台 trash 三级
+（含 .trashinfo 还原记录与冲突后缀同步）、blocked 红线并集、量不准不删、审批摘要 en/zh 快照）。
+权限降级（EACCES）用例需非 root 运行器，root 下自动跳过（root 的 DAC override 读穿 0000 权限）。
 
 **发布约定**：改完源码必须 `npm run build` 并把 `lib/*.js` 一并提交——git 安装直接加载已提交
 产物，不跑任何构建脚本（这也是免掉 pnpm ≥10 构建授权的方式）。
@@ -210,10 +243,18 @@ npm test                         # vitest（81 specs）+ tsc --noEmit，均借 h
   监控平级，order 30/31），悬浮窗"扫描"经 `sidebarRight.openTab` + autoScan 参数唤起窗口并自动
   扫描（重复唤起即重扫）；对话式种子路径退役。真实清理 e2e 三次验证（pip/npm/Homebrew 缓存 →
   废纸篓，字节吻合）。
-- **M3（规划中）**：应用清单与卸载 —— `/Applications` bundle 走查（du + kMDItemLastUseDate）、
-  `brew list` 合并、移废纸篓卸载、残留项（plist/`App Support`/缓存）报告。
-- **未排期**：温度（需 sudo）、进程级 GPU/磁盘真实取数（需特权 helper）、Windows/Linux、
-  pnpm store 引用计数感知清理、用户持久排除清单。
+- **M2.9（完成，2026-10-07）**：Linux 平台支持 —— 监控探针按平台分派（/proc/meminfo、/proc/net/dev、
+  /proc/diskstats 双采样差分、/sys/class/power_supply、/etc/os-release、nvidia-smi 尽力而为、
+  df 伪文件系统过滤、ps args 列）；垃圾注册表分平台（`JUNK_TARGETS_LINUX` 12 行 XDG 布局 +
+  `LINUX_PROTECTED_CHILDREN`/`LINUX_TEMP_PROTECTED` 保护清单）；blocked 红线并集（/etc、/var/lib、
+  /lib*、/boot 等）；trash 三级 Linux 落地（trash-put/gio trash → freedesktop `files/`+`info/`
+  带 `.trashinfo` 还原记录 → 跨卷 cp+rm）；工具文案与仪表盘标签平台中性化；测试套件在
+  Linux 与 macOS 双平台可绿（平台断言显式注入，root 环境跳过 EACCES 用例）。
+- **M3（规划中）**：应用清单与卸载 —— macOS `/Applications` bundle 走查（du + kMDItemLastUseDate）、
+  `brew list` 合并、移废纸篓卸载、残留项（plist/`App Support`/缓存）报告；Linux 侧
+  `dpkg-query` 清单与 `rc` 残留清理为后续候选。
+- **未排期**：温度（macOS 需 sudo；Linux hwmon 可读但字段未定）、进程级 GPU/磁盘真实取数
+  （需特权 helper）、Windows、pnpm store 引用计数感知清理、用户持久排除清单。
 
 ## License
 

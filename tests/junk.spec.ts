@@ -9,14 +9,16 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { chmod, mkdir, mkdtemp, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
+import { platform } from 'node:os'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
-  EDR_PROTECTED_PREFIXES, JUNK_KINDS, JUNK_TARGETS, PROTECTED_CHILDREN, RECOMMENDED_PLAN, cleanJunk,
-  describeJunkIds, expandGlobs, isRecommendedItem, matchesProtectedRule, measureTree, parseJunkId,
-  resolveTargets, scanJunk, validateJunkIds,
+  EDR_PROTECTED_PREFIXES, JUNK_KINDS, JUNK_TARGETS, JUNK_TARGETS_DARWIN, JUNK_TARGETS_LINUX, LINUX_PROTECTED_CHILDREN,
+  LINUX_TEMP_PROTECTED, PROTECTED_CHILDREN, cleanJunk, computeRecommendedPlan, describeJunkIds, expandGlobs,
+  isBlockedPath, isRecommendedItem, matchesProtectedRule, measureTree, parseJunkId, resolveTargets, resolveTrashCommand,
+  scanJunk, trashDirs, validateJunkIds,
 } from '../src/junk.ts'
 import type { JunkTarget } from '../src/junk.ts'
 
@@ -50,11 +52,13 @@ async function put(path: string, bytes: number): Promise<void> {
   await writeFile(path, Buffer.alloc(bytes, 1))
 }
 
-/** A fresh fake home with a sane ~/.Trash (0700, owned by the runner). */
-async function freshHome(): Promise<string> {
+/** A fresh fake home with a sane trash layout for the platform (0700, owned by the runner). */
+async function freshHome(plat: NodeJS.Platform = 'darwin'): Promise<string> {
   homeSeq += 1
   const home = join(base, `home-${homeSeq}`)
-  await mkdir(join(home, '.Trash'), { recursive: true, mode: 0o700 })
+  const dirs = trashDirs(plat, home)
+  await mkdir(dirs.files, { recursive: true, mode: 0o700 })
+  if (dirs.info !== null) await mkdir(dirs.info, { recursive: true, mode: 0o700 })
   return home
 }
 
@@ -65,16 +69,42 @@ const noTrashBin = {
   },
 }
 
+/**
+ * Permission-degradation tests need a non-root runner: root's
+ * CAP_DAC_OVERRIDE reads straight through 0000 modes, so the EACCES premise
+ * cannot be reproduced (design doc §11 anticipated "root 下 skip").
+ */
+const itNeedsNonRoot = process.getuid?.() === 0 ? it.skip : it
+
 describe('registry and protection lists', () => {
-  it('registers 19 rows over 18 kinds with the intended safety split', () => {
-    expect(JUNK_TARGETS).toHaveLength(19)
-    expect(new Set(JUNK_TARGETS.map(row => row.kind)).size).toBe(18)
+  it('registers the macOS registry as 19 rows over 18 kinds with the intended safety split', () => {
+    expect(JUNK_TARGETS_DARWIN).toHaveLength(19)
+    expect(new Set(JUNK_TARGETS_DARWIN.map(row => row.kind)).size).toBe(18)
     expect(JUNK_KINDS).toHaveLength(18)
-    const unsafe = [...new Set(JUNK_TARGETS.filter(row => !row.safeToClean).map(row => row.kind))].sort()
+    const unsafe = [...new Set(JUNK_TARGETS_DARWIN.filter(row => !row.safeToClean).map(row => row.kind))].sort()
     expect(unsafe).toEqual(['pnpm-store', 'simulator-unavailable-devices'])
   })
 
-  it('pins every sensitive-cache protection rule', () => {
+  it('registers the Linux registry as 12 rows over 11 kinds on the XDG layout', () => {
+    expect(JUNK_TARGETS_LINUX).toHaveLength(12)
+    expect(new Set(JUNK_TARGETS_LINUX.map(row => row.kind)).size).toBe(11)
+    expect(JUNK_TARGETS_LINUX.filter(row => row.kind === 'system-temp').map(row => row.dir)).toEqual(['/tmp', '/var/tmp'])
+    expect(JUNK_TARGETS_LINUX.filter(row => row.kind === 'trash')[0]?.dir).toBe('~/.local/share/Trash')
+    expect(JUNK_TARGETS_LINUX.filter(row => row.kind === 'user-caches')[0]?.dir).toBe('~/.cache')
+    const unsafe = [...new Set(JUNK_TARGETS_LINUX.filter(row => !row.safeToClean).map(row => row.kind))]
+    expect(unsafe).toEqual(['pnpm-store'])
+    // macOS-only kinds never appear as Linux rows.
+    for (const macOnly of ['user-logs', 'xcode-derived-data', 'xcode-archives', 'xcode-ios-device-support',
+      'xcode-simulator-caches', 'simulator-unavailable-devices', 'ios-backups']) {
+      expect(JUNK_TARGETS_LINUX.some(row => row.kind === macOnly)).toBe(false)
+    }
+  })
+
+  it('dispatches JUNK_TARGETS by the runtime platform', () => {
+    expect(JUNK_TARGETS).toBe(platform() === 'linux' ? JUNK_TARGETS_LINUX : JUNK_TARGETS_DARWIN)
+  })
+
+  it('pins every sensitive-cache protection rule (macOS)', () => {
     expect(PROTECTED_CHILDREN).toEqual([
       'com.1password.', 'com.agilebits.', 'com.bitwarden.', 'com.keepassx.', 'org.keepassxc.', 'com.lastpass.', 'com.dashlane.',
       'com.jetbrains.', 'com.microsoft.VSCode', 'com.visualstudio.code.', 'com.sublimetext.',
@@ -85,15 +115,39 @@ describe('registry and protection lists', () => {
     ])
   })
 
+  it('pins every Linux ~/.cache protection rule', () => {
+    expect(LINUX_PROTECTED_CHILDREN).toEqual([
+      '1password', 'bitwarden', 'keepass', 'keepassxc', 'lastpass', 'dashlane',
+      'jetbrains', 'vscode', 'Code', 'sublime-text', 'sublime',
+      'fcitx', 'ibus', 'rime',
+      'clash', 'Clash', 'tailscale', 'Tailscale', 'openvpn', 'OpenVPN',
+      'wireguard', 'WireGuard', 'zerotier', 'mullvad',
+      'dropbox', 'Dropbox', 'onedrive', 'OneDrive', 'google-drive', 'nextcloud', 'syncthing',
+      'ollama', 'jan', 'lm-studio', 'claude', 'Claude',
+    ])
+  })
+
+  it('pins the Linux temp protection list (live services and EDR)', () => {
+    expect(LINUX_TEMP_PROTECTED).toEqual([
+      'systemd-private-', 'snap-private-tmp',
+      'falcon', 'crowdstrike', 'sentinelone', 's1agent', 'carbonblack', 'cb-defense',
+      'mde', 'sophos', 'defender',
+    ])
+  })
+
   it('pins every EDR prefix and attaches protections to the right rows', () => {
     expect(EDR_PROTECTED_PREFIXES).toEqual([
       'com.crowdstrike.', 'com.sentinelone.', 'com.sentinel-labs.', 'com.eset.',
       'com.jamf.', 'com.jamfsoftware.', 'com.paloaltonetworks.', 'com.cisco.anyconnect', 'com.cisco.secureclient',
     ])
-    expect(JUNK_TARGETS.filter(row => row.kind === 'user-caches').every(row => row.protectedChildren === PROTECTED_CHILDREN)).toBe(true)
-    const systemTemp = JUNK_TARGETS.filter(row => row.kind === 'system-temp')
+    expect(JUNK_TARGETS_DARWIN.filter(row => row.kind === 'user-caches').every(row => row.protectedChildren === PROTECTED_CHILDREN)).toBe(true)
+    const systemTemp = JUNK_TARGETS_DARWIN.filter(row => row.kind === 'system-temp')
     expect(systemTemp).toHaveLength(2)
     expect(systemTemp.every(row => row.protectedChildren === EDR_PROTECTED_PREFIXES && row.minAgeDays === 3)).toBe(true)
+    expect(JUNK_TARGETS_LINUX.filter(row => row.kind === 'user-caches').every(row => row.protectedChildren === LINUX_PROTECTED_CHILDREN)).toBe(true)
+    const linuxTemp = JUNK_TARGETS_LINUX.filter(row => row.kind === 'system-temp')
+    expect(linuxTemp).toHaveLength(2)
+    expect(linuxTemp.every(row => row.protectedChildren === LINUX_TEMP_PROTECTED && row.minAgeDays === 3)).toBe(true)
   })
 
   it('matches prefix, suffix, and substring rules', () => {
@@ -103,25 +157,36 @@ describe('registry and protection lists', () => {
     expect(matchesProtectedRule('com.apple.inputmethod.extra', '*.inputmethod')).toBe(false)
     expect(matchesProtectedRule('net.pietje.clashx', '*clash*')).toBe(true)
     expect(matchesProtectedRule('ClashX Pro', '*Clash*')).toBe(true)
+    expect(matchesProtectedRule('systemd-private-sshd.service-x/tmp', 'systemd-private-')).toBe(true)
   })
 })
 
 describe('recommended plan preset', () => {
-  it('pre-checks every safe regenerable kind and excludes the rest', () => {
-    expect([...RECOMMENDED_PLAN.kinds].sort()).toEqual([
+  it('pre-checks every safe regenerable kind on the macOS registry', () => {
+    expect([...computeRecommendedPlan(JUNK_TARGETS_DARWIN).kinds].sort()).toEqual([
       'go-build-cache', 'go-mod-cache', 'homebrew-cache', 'npm-cache', 'pip-cache', 'system-temp',
       'trash', 'user-caches', 'user-logs', 'uv-cache', 'xcode-derived-data',
       'xcode-ios-device-support', 'xcode-simulator-caches', 'yarn-cache',
     ])
     // Non-regenerable and not-directly-cleanable kinds are never pre-checked.
-    expect(RECOMMENDED_PLAN.kinds).not.toContain('ios-backups')
-    expect(RECOMMENDED_PLAN.kinds).not.toContain('xcode-archives')
-    expect(RECOMMENDED_PLAN.kinds).not.toContain('pnpm-store')
-    expect(RECOMMENDED_PLAN.kinds).not.toContain('simulator-unavailable-devices')
+    const darwin = computeRecommendedPlan(JUNK_TARGETS_DARWIN).kinds
+    expect(darwin).not.toContain('ios-backups')
+    expect(darwin).not.toContain('xcode-archives')
+    expect(darwin).not.toContain('pnpm-store')
+    expect(darwin).not.toContain('simulator-unavailable-devices')
+  })
+
+  it('pre-checks the safe kinds on the Linux registry (no non-regenerable rows there)', () => {
+    expect([...computeRecommendedPlan(JUNK_TARGETS_LINUX).kinds].sort()).toEqual([
+      'go-build-cache', 'go-mod-cache', 'homebrew-cache', 'npm-cache', 'pip-cache', 'system-temp',
+      'trash', 'user-caches', 'uv-cache', 'yarn-cache',
+    ])
   })
 
   it('requires the 1 MiB threshold for a pre-checked item', () => {
-    expect(RECOMMENDED_PLAN.minItemBytes).toBe(1024 * 1024)
+    for (const plan of [computeRecommendedPlan(JUNK_TARGETS_DARWIN), computeRecommendedPlan(JUNK_TARGETS_LINUX)]) {
+      expect(plan.minItemBytes).toBe(1024 * 1024)
+    }
     expect(isRecommendedItem({ kind: 'user-caches', sizeBytes: 1024 * 1024 })).toBe(true)
     expect(isRecommendedItem({ kind: 'user-caches', sizeBytes: 1024 * 1024 - 1 })).toBe(false)
     expect(isRecommendedItem({ kind: 'ios-backups', sizeBytes: 1024 ** 3 })).toBe(false)
@@ -191,7 +256,7 @@ describe('measureTree', () => {
     expect(stale.maxMtimeMs).toBe(old.getTime())
   })
 
-  it('records permission-degraded subtrees instead of failing the walk', async () => {
+  itNeedsNonRoot('records permission-degraded subtrees instead of failing the walk', async () => {
     const root = join(base, 'walk-eacces')
     await put(join(root, 'top.bin'), 10)
     await put(join(root, 'locked/inner.bin'), 999)
@@ -297,7 +362,7 @@ describe('scanJunk', () => {
     expect(report.totalBytes).toBe(0)
   })
 
-  it('records permission-degraded children as skipped without an item', async () => {
+  itNeedsNonRoot('records permission-degraded children as skipped without an item', async () => {
     const caches = join(base, 'scan-eacces-child')
     await put(join(caches, 'locked/inner'), 500)
     await chmod(join(caches, 'locked'), 0o000)
@@ -361,6 +426,34 @@ describe('validateJunkIds', () => {
     await expect(validateJunkIds([`user-caches:${home}`], homeRoot, home)).rejects.toMatchObject({ code: 'unsafe_target' })
   })
 
+  it('rejects Linux red-line paths even when a registry row would contain them', async () => {
+    const misconfigured = await expandGlobs([
+      target('user-caches', '/etc', { granularity: 'children' }),
+      target('user-caches', '/var/lib', { granularity: 'children' }),
+      target('user-caches', '/lib', { granularity: 'children' }),
+    ])
+    await expect(validateJunkIds(['user-caches:/etc/app.conf'], misconfigured, home)).rejects.toMatchObject({ code: 'unsafe_target' })
+    await expect(validateJunkIds(['user-caches:/var/lib/dpkg'], misconfigured, home)).rejects.toMatchObject({ code: 'unsafe_target' })
+    await expect(validateJunkIds(['user-caches:/lib/modules/6.1.0-25-amd64'], misconfigured, home)).rejects.toMatchObject({ code: 'unsafe_target' })
+  })
+
+  it('blocks other users home trees on both layouts, and root home when it is not $HOME', () => {
+    // /Users layout (macOS)
+    expect(isBlockedPath('/Users/other/x', '/Users/tester')).toBe(true)
+    expect(isBlockedPath('/Users/tester/x', '/Users/tester')).toBe(false)
+    expect(isBlockedPath('/home/anyone/x', '/Users/tester')).toBe(true)
+    // /home layout (Linux)
+    expect(isBlockedPath('/home/other/x', '/home/tester')).toBe(true)
+    expect(isBlockedPath('/home/tester/x', '/home/tester')).toBe(false)
+    expect(isBlockedPath('/Users/anyone/x', '/home/tester')).toBe(true)
+    // root's home
+    expect(isBlockedPath('/root/x', '/home/tester')).toBe(true)
+    expect(isBlockedPath('/root/x', '/root')).toBe(false)
+    // shared system trees
+    expect(isBlockedPath('/srv/data', '/home/tester')).toBe(true)
+    expect(isBlockedPath('/boot/efi', '/home/tester')).toBe(true)
+  })
+
   it('rejects kinds marked not safe to clean, with the suggested command in the message', async () => {
     const store = join(base, 'validate-pnpm')
     await put(join(store, 'v3/file'), 1)
@@ -405,13 +498,14 @@ describe('cleanJunk', () => {
     expect(existsSync(join(caches, 'item'))).toBe(false)
   })
 
-  it('falls back to renaming into ~/.Trash with conflict suffixes', async () => {
-    const home = await freshHome()
+  it('falls back to renaming into ~/.Trash with conflict suffixes (darwin)', async () => {
+    const home = await freshHome('darwin')
     const caches = join(base, 'clean-tier2')
     await put(join(caches, 'item/f'), 128)
     await put(join(home, '.Trash', 'item', 'existing'), 1)
     const result = await cleanJunk([`user-caches:${join(caches, 'item')}`], 'trash', [target('user-caches', caches)], {
       home,
+      platform: 'darwin',
       io: noTrashBin,
     })
     expect(result.outcomes[0]?.error).toBeUndefined()
@@ -421,12 +515,36 @@ describe('cleanJunk', () => {
     expect(result.totalReclaimedBytes).toBe(128)
   })
 
+  it('moves into the freedesktop trash layout with a restore record and synced conflict suffix (linux)', async () => {
+    const home = await freshHome('linux')
+    const caches = join(base, 'clean-linux-tier2')
+    await put(join(caches, 'item/f'), 128)
+    // Occupy both faces of the name "item": a stale file in files/ and a
+    // leftover record in info/ — the reservation must skip both.
+    await put(join(home, '.local/share/Trash/files/item/stale'), 1)
+    await put(join(home, '.local/share/Trash/info/item.trashinfo'), 40)
+    const result = await cleanJunk([`user-caches:${join(caches, 'item')}`], 'trash', [target('user-caches', caches)], {
+      home,
+      platform: 'linux',
+      io: noTrashBin,
+    })
+    expect(result.outcomes[0]?.error).toBeUndefined()
+    expect(existsSync(join(caches, 'item'))).toBe(false)
+    expect(existsSync(join(home, '.local/share/Trash/files/item 2/f'))).toBe(true)
+    const record = await readFile(join(home, '.local/share/Trash/info/item 2.trashinfo'), 'utf8')
+    expect(record).toContain('[Trash Info]')
+    expect(record).toContain(`Path=${join(caches, 'item')}`)
+    expect(record).toMatch(/DeletionDate=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/)
+    expect(result.totalReclaimedBytes).toBe(128)
+  })
+
   it('copies and removes across volumes when rename throws EXDEV', async () => {
-    const home = await freshHome()
+    const home = await freshHome('darwin')
     const caches = join(base, 'clean-tier3')
     await put(join(caches, 'item/f'), 512)
     const result = await cleanJunk([`user-caches:${join(caches, 'item')}`], 'trash', [target('user-caches', caches)], {
       home,
+      platform: 'darwin',
       io: {
         runTrashCommand: noTrashBin.runTrashCommand,
         rename: async () => {
@@ -440,13 +558,14 @@ describe('cleanJunk', () => {
   })
 
   it('refuses an unsafe ~/.Trash and leaves the item untouched', async () => {
-    const home = await freshHome()
+    const home = await freshHome('darwin')
     await chmod(join(home, '.Trash'), 0o020)
     const caches = join(base, 'clean-badtrash')
     await put(join(caches, 'item/f'), 32)
     try {
       const result = await cleanJunk([`user-caches:${join(caches, 'item')}`], 'trash', [target('user-caches', caches)], {
         home,
+        platform: 'darwin',
         io: noTrashBin,
       })
       expect(result.outcomes[0]?.reclaimedBytes).toBe(0)
@@ -454,6 +573,26 @@ describe('cleanJunk', () => {
       expect(existsSync(join(caches, 'item', 'f'))).toBe(true)
     } finally {
       await chmod(join(home, '.Trash'), 0o700)
+    }
+  })
+
+  it('refuses a group-writable freedesktop files face (linux)', async () => {
+    const home = await freshHome('linux')
+    const filesFace = join(home, '.local/share/Trash/files')
+    await chmod(filesFace, 0o770)
+    const caches = join(base, 'clean-linux-badtrash')
+    await put(join(caches, 'item/f'), 32)
+    try {
+      const result = await cleanJunk([`user-caches:${join(caches, 'item')}`], 'trash', [target('user-caches', caches)], {
+        home,
+        platform: 'linux',
+        io: noTrashBin,
+      })
+      expect(result.outcomes[0]?.reclaimedBytes).toBe(0)
+      expect(result.outcomes[0]?.error).toContain('trash_failed')
+      expect(existsSync(join(caches, 'item', 'f'))).toBe(true)
+    } finally {
+      await chmod(filesFace, 0o700)
     }
   })
 
@@ -467,7 +606,7 @@ describe('cleanJunk', () => {
     expect(existsSync(join(caches, 'item'))).toBe(false)
   })
 
-  it('refuses items whose re-measure is incomplete, leaving them untouched', async () => {
+  itNeedsNonRoot('refuses items whose re-measure is incomplete, leaving them untouched', async () => {
     const caches = join(base, 'clean-degraded-child')
     await put(join(caches, 'item/ok'), 16)
     await put(join(caches, 'item/locked/inner'), 999)
@@ -499,7 +638,7 @@ describe('cleanJunk', () => {
     expect(result.totalReclaimedBytes).toBe(2)
   })
 
-  it('skips items it cannot re-measure, leaving them untouched', async () => {
+  itNeedsNonRoot('skips items it cannot re-measure, leaving them untouched', async () => {
     const caches = join(base, 'clean-unmeasurable')
     await put(join(caches, 'item/inner'), 800)
     await chmod(join(caches, 'item'), 0o000)
@@ -513,13 +652,14 @@ describe('cleanJunk', () => {
     }
   })
 
-  it('empties the trash kind in place instead of moving it into itself', async () => {
-    const home = await freshHome()
+  it('empties the trash kind in place instead of moving it into itself (darwin)', async () => {
+    const home = await freshHome('darwin')
     const trashDir = join(home, '.Trash')
     await put(join(trashDir, 'discarded/f'), 64)
     const trashCalls: string[][] = []
     const result = await cleanJunk([`trash:${trashDir}`], 'trash', [target('trash', trashDir, { granularity: 'whole' })], {
       home,
+      platform: 'darwin',
       io: {
         runTrashCommand: async paths => {
           trashCalls.push([...paths])
@@ -530,6 +670,44 @@ describe('cleanJunk', () => {
     expect(result.outcomes).toEqual([{ id: `trash:${trashDir}`, reclaimedBytes: 64 }])
     expect(existsSync(trashDir)).toBe(true)
     expect(await readdir(trashDir)).toEqual([])
+  })
+
+  it('empties the linux trash layout in place, keeping files/ and info/ directories', async () => {
+    const home = await freshHome('linux')
+    const trashRoot = join(home, '.local/share/Trash')
+    await put(join(trashRoot, 'files/discarded/f'), 64)
+    await put(join(trashRoot, 'info/discarded.trashinfo'), 40)
+    const trashCalls: string[][] = []
+    const result = await cleanJunk([`trash:${trashRoot}`], 'trash', [target('trash', trashRoot, { granularity: 'whole' })], {
+      home,
+      platform: 'linux',
+      io: {
+        runTrashCommand: async paths => {
+          trashCalls.push([...paths])
+        },
+      },
+    })
+    expect(trashCalls).toEqual([])
+    expect(result.outcomes).toEqual([{ id: `trash:${trashRoot}`, reclaimedBytes: 104 }])
+    expect(existsSync(join(trashRoot, 'files'))).toBe(true)
+    expect(existsSync(join(trashRoot, 'info'))).toBe(true)
+    expect(await readdir(join(trashRoot, 'files'))).toEqual([])
+    expect(await readdir(join(trashRoot, 'info'))).toEqual([])
+  })
+})
+
+describe('trash layout and tier-1 resolution', () => {
+  it('maps the trash layout per platform', () => {
+    expect(trashDirs('darwin', '/Users/t')).toEqual({ root: '/Users/t/.Trash', files: '/Users/t/.Trash', info: null })
+    expect(trashDirs('linux', '/home/t')).toEqual({
+      root: '/home/t/.local/share/Trash',
+      files: '/home/t/.local/share/Trash/files',
+      info: '/home/t/.local/share/Trash/info',
+    })
+  })
+
+  it('resolves no tier-1 trash utility on unsupported platforms', async () => {
+    await expect(resolveTrashCommand('win32')).resolves.toBeNull()
   })
 })
 

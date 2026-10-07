@@ -53,9 +53,9 @@ export interface ProcessInfo {
   rssBytes: number
   /** Command path or name, truncated by ps to its own width. */
   command: string
-  /** Cumulative inbound bytes since process start (`nettop`); null when unavailable. */
+  /** Cumulative inbound bytes since process start; null when unavailable (macOS nettop; no unprivileged Linux source). */
   netRxBytes: number | null
-  /** Cumulative outbound bytes since process start (`nettop`); null when unavailable. */
+  /** Cumulative outbound bytes since process start; null when unavailable (macOS nettop; no unprivileged Linux source). */
   netTxBytes: number | null
   /** Per-process GPU percent; needs a privileged helper, so always null today. */
   gpuPercent: number | null
@@ -85,7 +85,7 @@ export interface BatteryStatus {
 
 /** One network interface's cumulative byte counters (`netstat -ib`). */
 export interface NetworkInterface {
-  /** BSD interface name, e.g. `en0`; loopback is excluded. */
+  /** Interface name, e.g. `en0` (macOS) or `eth0` (Linux); loopback is excluded. */
   interface: string
   /** Cumulative inbound bytes since boot. */
   rxBytes: number
@@ -97,7 +97,7 @@ export interface NetworkInterface {
 export interface SystemStatus {
   platform: string
   hostname: string
-  /** macOS product version, e.g. `26.2`; null when `sw_vers` is unavailable. */
+  /** OS version as the platform reports it (macOS product version e.g. `26.2`; Linux /etc/os-release PRETTY_NAME); null when unavailable. */
   osVersion: string | null
   uptimeSeconds: number
   cpu: {
